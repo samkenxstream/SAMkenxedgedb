@@ -471,6 +471,12 @@ def trace_NamedTuple(node: qlast.NamedTuple, *, ctx: TracerContext) -> None:
 
 
 @trace.register
+def trace_Range(node: qlast.Range, *, ctx: TracerContext) -> None:
+    trace(node.lower, ctx=ctx)
+    trace(node.upper, ctx=ctx)
+
+
+@trace.register
 def trace_BinOp(node: qlast.BinOp, *, ctx: TracerContext) -> None:
     trace(node.left, ctx=ctx)
     trace(node.right, ctx=ctx)

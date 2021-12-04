@@ -459,7 +459,7 @@ def typeref_to_ast(
         result = qlast.TypeName(
             name=_name,
             maintype=qlast.ObjectRef(
-                name=t.schema_name
+                name=t.get_schema_name()
             ),
             subtypes=[
                 typeref_to_ast(schema, st, _name=sn,
@@ -468,12 +468,12 @@ def typeref_to_ast(
             ]
         )
     elif isinstance(t, (s_types.Array, s_types.Tuple)):
-        # Here the concrete type Array is used because t.schema_name is used,
-        # which is not defined for more generic collections and abcs
+        # Here the concrete type Array is used because t.get_schema_name()
+        # is used, which is not defined for more generic collections and abcs
         result = qlast.TypeName(
             name=_name,
             maintype=qlast.ObjectRef(
-                name=t.schema_name
+                name=t.get_schema_name()
             ),
             subtypes=[
                 typeref_to_ast(schema, st,
@@ -825,7 +825,7 @@ def enrich_schema_lookup_error(
         collection=collection, condition=condition)
 
     if suggestions:
-        names: Union[List[str]] = []
+        names: List[str] = []
         cur_module_name = modaliases.get(None)
 
         for suggestion in suggestions:

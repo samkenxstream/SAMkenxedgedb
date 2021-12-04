@@ -946,6 +946,9 @@ class BaseAtomicExpr(Nonterm):
     def reduce_FuncExpr(self, *kids):
         self.val = kids[0].val
 
+    def reduce_RangeLiteral(self, *kids):
+        self.val = kids[0].val
+
     def reduce_Tuple(self, *kids):
         self.val = kids[0].val
 
@@ -1190,6 +1193,14 @@ class Expr(Nonterm):
                                right=kids[2].val)
 
 
+class OptExpr(Nonterm):
+    def reduce_Expr(self, *kids):
+        self.val = kids[0].val
+
+    def reduce_empty(self):
+        self.val = None
+
+
 class Tuple(Nonterm):
     def reduce_LPAREN_Expr_COMMA_OptExprList_RPAREN(self, *kids):
         self.val = qlast.Tuple(elements=[kids[1].val] + kids[3].val)
@@ -1228,6 +1239,40 @@ class Collection(Nonterm):
     def reduce_LBRACKET_OptExprList_RBRACKET(self, *kids):
         elements = kids[1].val
         self.val = qlast.Array(elements=elements)
+
+
+class RangeLiteral(Nonterm):
+    def reduce_LBRACKET_OptExpr_DOTDOT_OptExpr_RBRACKET(self, *kids):
+        self.val = qlast.Range(
+            lower=kids[1].val,
+            upper=kids[3].val,
+            lower_inc=True,
+            upper_inc=True,
+        )
+
+    def reduce_LPAREN_OptExpr_DOTDOT_OptExpr_RPAREN(self, *kids):
+        self.val = qlast.Range(
+            lower=kids[1].val,
+            upper=kids[3].val,
+            lower_inc=False,
+            upper_inc=False,
+        )
+
+    def reduce_LBRACKET_OptExpr_DOTDOT_OptExpr_RPAREN(self, *kids):
+        self.val = qlast.Range(
+            lower=kids[1].val,
+            upper=kids[3].val,
+            lower_inc=True,
+            upper_inc=False,
+        )
+
+    def reduce_LPAREN_OptExpr_DOTDOT_OptExpr_RBRACKET(self, *kids):
+        self.val = qlast.Range(
+            lower=kids[1].val,
+            upper=kids[3].val,
+            lower_inc=False,
+            upper_inc=True,
+        )
 
 
 class OptExprList(Nonterm):

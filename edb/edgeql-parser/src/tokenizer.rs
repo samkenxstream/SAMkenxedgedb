@@ -41,6 +41,7 @@ pub enum Kind {
     OpenBrace,        // {
     CloseBrace,       // }
     Dot,              // .
+    DotDot,           // ..
     Semicolon,        // ;
     Colon,            // :
     Add,              // +
@@ -256,6 +257,7 @@ impl<'a> TokenStream<'a> {
             },
             '.' => match iter.next() {
                 Some((_, '<')) => return Ok((BackwardLink, 2)),
+                Some((_, '.')) => return Ok((DotDot, 2)),
                 _ => return Ok((Dot, 1)),
             },
             '?' => match iter.next() {

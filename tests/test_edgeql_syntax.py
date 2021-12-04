@@ -1988,7 +1988,7 @@ aa';
         SELECT .<foo;
         """
 
-    @tb.must_fail(errors.EdgeQLSyntaxError, "Unexpected '.'", line=2)
+    @tb.must_fail(errors.EdgeQLSyntaxError, "Unexpected '..'", line=2)
     def test_edgeql_syntax_path_17(self):
         """
         SELECT ..foo;

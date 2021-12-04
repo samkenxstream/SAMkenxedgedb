@@ -870,9 +870,12 @@ class IntersectionTypeShell(TypeExprShell[TypeT_co]):
         )
 
 
+_collection_impls: Dict[str, typing.Type[Collection]] = {}
+
+
 class Collection(Type, s_abc.Collection):
 
-    schema_name: typing.ClassVar[str]
+    _schema_name: typing.ClassVar[typing.Optional[str]] = None
 
     #: True for collection types that are stored in schema persistently
     is_persistent = so.SchemaField(
@@ -881,12 +884,34 @@ class Collection(Type, s_abc.Collection):
         compcoef=None,
     )
 
+    def __init_subclass__(
+        cls,
+        *,
+        schema_name: typing.Optional[str] = None,
+    ) -> None:
+        super().__init_subclass__()
+        if schema_name is not None:
+            if existing := _collection_impls.get(schema_name):
+                raise TypeError(
+                    f"{schema_name} is already implemented by {existing}")
+            _collection_impls[schema_name] = cls
+            cls._schema_name = schema_name
+
     @classmethod
     def get_displayname_static(cls, name: s_name.Name) -> str:
         if isinstance(name, s_name.QualName):
             return str(name)
         else:
             return s_name.unmangle_name(str(name))
+
+    @classmethod
+    def get_schema_name(cls) -> str:
+        if cls._schema_name is None:
+            raise TypeError(
+                f"{cls.get_schema_class_displayname()} is not "
+                f"a concrete collection type"
+            )
+        return cls._schema_name
 
     def get_generated_name(self, schema: s_schema.Schema) -> s_name.UnqualName:
         """Return collection type name generated from element types.
@@ -984,14 +1009,13 @@ class Collection(Type, s_abc.Collection):
     @classmethod
     def get_class(
         cls, schema_name: str
-    ) -> Union[typing.Type[Array], typing.Type[Tuple]]:
-        if schema_name == 'array':
-            return Array
-        elif schema_name == 'tuple':
-            return Tuple
-
-        raise errors.SchemaError(
-            'unknown collection type: {!r}'.format(schema_name))
+    ) -> typing.Type[Collection]:
+        coll_type = _collection_impls.get(schema_name)
+        if coll_type:
+            return coll_type
+        else:
+            raise errors.SchemaError(
+                'unknown collection type: {!r}'.format(schema_name))
 
     @classmethod
     def from_subtypes(
@@ -1088,9 +1112,8 @@ class Array(
     Collection,
     s_abc.Array,
     qlkind=qltypes.SchemaObjectClass.ARRAY_TYPE,
+    schema_name='array',
 ):
-
-    schema_name = 'array'
 
     element_type = so.SchemaField(
         Type,
@@ -1490,9 +1513,8 @@ class Tuple(
     Collection,
     s_abc.Tuple,
     qlkind=qltypes.SchemaObjectClass.TUPLE_TYPE,
+    schema_name='tuple',
 ):
-
-    schema_name = 'tuple'
 
     named = so.SchemaField(
         bool,

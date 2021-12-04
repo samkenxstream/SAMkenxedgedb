@@ -51,6 +51,10 @@ class T_DOTBW(Token, lextoken='.<'):
     pass
 
 
+class T_DOTDOT(Token, lextoken='..'):
+    pass
+
+
 class T_LBRACKET(Token, lextoken='['):
     pass
 

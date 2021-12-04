@@ -463,6 +463,13 @@ class Array(Expr):
     elements: typing.List[Expr]
 
 
+class Range(Expr):
+    lower: typing.Optional[Expr]
+    upper: typing.Optional[Expr]
+    lower_inc: bool
+    upper_inc: bool
+
+
 class Set(Expr):
     elements: typing.List[Expr]
 
