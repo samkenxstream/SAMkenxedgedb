@@ -43,10 +43,13 @@ async def proxy_request(
     server  # : server.Server,  # circular import
 ) -> None:
     req_data = pickle.dumps(dict(
-        method=bytes(request.method),
-        url=request.uri,
-        headers=request.headers,
-        body=request.body,
+        request="http",
+        params=dict(
+            method=bytes(request.method),
+            url=request.uri,
+            headers=request.headers,
+            body=request.body,
+        )
     ), protocol=5)
 
     loop = asyncio.get_running_loop()
@@ -64,6 +67,7 @@ async def proxy_request(
     response.content_type = headers.pop('content-type', None)
     response.custom_headers = headers
     response.body = resp_data['body']
+
 
 async def handle_request(
     request: protocol.HttpRequest,
