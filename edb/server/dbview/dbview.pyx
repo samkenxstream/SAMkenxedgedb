@@ -641,7 +641,7 @@ cdef class DatabaseIndex:
         reflection_cache,
         backend_ids,
         refresh=False
-    ):
+    ) -> Database:
         cdef Database db
         db = self._dbs.get(dbname)
         if db is not None:
@@ -660,6 +660,7 @@ cdef class DatabaseIndex:
                 backend_ids=backend_ids,
             )
             self._dbs[dbname] = db
+        return db
 
     def unregister_db(self, dbname):
         self._dbs.pop(dbname)

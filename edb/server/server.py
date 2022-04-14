@@ -29,6 +29,7 @@ import ipaddress
 import json
 import logging
 import os
+import pathlib
 import pickle
 import socket
 import ssl
@@ -63,6 +64,8 @@ from edb.server.protocol import binary  # type: ignore
 from edb.server import metrics
 from edb.server import pgcon
 from edb.server.pgcon import errors as pgcon_errors
+
+from edb.wasm import server as wasm
 
 from . import dbview
 
@@ -117,6 +120,8 @@ class Server(ha_base.ClusterProtocol):
     _binary_conns: collections.OrderedDict[binary.EdgeConnection, bool]
     _idle_gc_handler: asyncio.TimerHandle | None = None
     _session_idle_timeout: int | None = None
+
+    _wasm_server: wasm.Server | None = None
 
     def __init__(
         self,
@@ -246,6 +251,12 @@ class Server(ha_base.ClusterProtocol):
         self._session_idle_timeout = None
 
         self._admin_ui = admin_ui
+
+    def _ensure_wasm(self):
+        if self._wasm_server is None:
+            self._wasm_server = wasm.WasmServer(
+                sock_path=pathlib.Path(self._runstate_dir) / '.s.wasm_ext',
+            )
 
     async def _request_stats_logger(self):
         last_seen = -1
@@ -732,7 +743,7 @@ class Server(ha_base.ClusterProtocol):
             db_config = await self.introspect_db_config(conn)
 
             assert self._dbindex is not None
-            self._dbindex.register_db(
+            db = self._dbindex.register_db(
                 dbname,
                 user_schema=user_schema,
                 db_config=db_config,
@@ -740,6 +751,8 @@ class Server(ha_base.ClusterProtocol):
                 backend_ids=backend_ids,
                 refresh=True,
             )
+            if 'webassembly' in db.extensions:
+                self._ensure_wasm()
         finally:
             self.release_pgcon(dbname, conn)
 
