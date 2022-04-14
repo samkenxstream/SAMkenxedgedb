@@ -9,7 +9,7 @@ from functools import partial
 from edb import errors
 from edb.server.protocol import protocol
 from edb.server.dbview import dbview
-#from edb.server import server
+
 
 log = logging.getLogger(__name__)
 

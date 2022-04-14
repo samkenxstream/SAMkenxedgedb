@@ -3,7 +3,6 @@ import logging
 import os
 import pathlib
 import socket
-import subprocess
 import sys
 
 

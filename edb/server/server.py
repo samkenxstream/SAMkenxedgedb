@@ -121,7 +121,7 @@ class Server(ha_base.ClusterProtocol):
     _idle_gc_handler: asyncio.TimerHandle | None = None
     _session_idle_timeout: int | None = None
 
-    _wasm_server: wasm.Server | None = None
+    _wasm_server: wasm.WasmServer | None = None
 
     def __init__(
         self,
