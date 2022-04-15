@@ -5,6 +5,8 @@ import pathlib
 import socket
 import sys
 
+from edb.common import debug
+
 
 log = logging.getLogger(__name__)
 
@@ -21,7 +23,6 @@ class WasmServer:
     _sock_path: pathlib.Path
 
     def __init__(self, sock_path: pathlib.Path):
-        log.info("Starting WebAssembly server")
         self._loop = asyncio.get_running_loop()
         self._process = None
         self._sock_path = sock_path
@@ -36,8 +37,11 @@ class WasmServer:
             sys.exit(1)  # TODO(tailhook) is it a greatest way to solve this?
 
     async def _start_inner(self):
-        if os.environ.get("EDGEDB_DEBUG_SKIP_WASM_SERVER_START"):
+        if debug.flags.skip_wasm_server_start:
+            log.info("WebAssembly server is skipped "
+                     "(assumed to be started externally)")
             return
+        log.info("Starting WebAssembly server")
         thisdir = pathlib.Path(__file__).parent
         if self._sock_path.exists():
             os.unlink(self._sock_path)
