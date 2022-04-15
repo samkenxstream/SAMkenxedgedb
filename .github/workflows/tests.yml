@@ -191,17 +191,17 @@ jobs:
       if: steps.wasm-cache.outputs.cache-hit != 'true'
       with:
         path: ${{ env.BUILD_TEMP }}/rust/wasm
-        key: edb-wasm-build-v1-${{ env.EDGEDBCLI_GIT_REV }}
+        key: edb-wasm-build-v1-${{ env.EDGEDBWASM_GIT_REV }}
         restore-keys: |
           edb-wasm-build-v4-
 
-    - name: Build EdgeDB CLI
+    - name: Build EdgeDB WASM
       env:
         CARGO_HOME: ${{ env.BUILD_TEMP }}/rust/wasm/cargo_home
         CACHE_HIT: ${{ steps.wasm-cache.outputs.cache-hit }}
       run: |
         if [[ "$CACHE_HIT" == "true" ]]; then
-          cp -v build/wasm/bin/edgedb edb/wasm/edgedb
+          cp -v build/wasm/bin/edgedb-wasm-server edb/wasm/edgedb-wasm-server
         else
           python setup.py -v build_wasm
         fi
