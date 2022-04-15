@@ -36,6 +36,8 @@ class WasmServer:
             sys.exit(1)  # TODO(tailhook) is it a greatest way to solve this?
 
     async def _start_inner(self):
+        if os.environ.get("EDGEDB_DEBUG_SKIP_WASM_SERVER_START"):
+            return
         thisdir = pathlib.Path(__file__).parent
         if self._sock_path.exists():
             os.unlink(self._sock_path)

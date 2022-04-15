@@ -62,11 +62,18 @@ async def proxy_request(
     writer.write(req_data)
     writer.write_eof()
     resp_data = pickle.loads(await reader.read())
-    response.status = http.HTTPStatus(resp_data['status'])
-    headers = resp_data['headers']
-    response.content_type = headers.pop('content-type', None)
-    response.custom_headers = headers
-    response.body = resp_data['body']
+    match resp_data["response"]:
+        case "success":
+            response.status = http.HTTPStatus(resp_data['status'])
+            headers = resp_data['headers']
+            response.content_type = headers.pop('content-type', None)
+            response.custom_headers = headers
+            response.body = resp_data['body']
+        case "failure":
+            log.error("Wasm request failed: %s", resp_data["error"])
+            response.status = http.HTTPStatus.INTERNAL_SERVER_ERROR
+            response.content_type = b"text/plain"
+            response.body = b"500 Internal Server Error"
 
 
 async def handle_request(
