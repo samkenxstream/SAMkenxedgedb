@@ -14,6 +14,12 @@ from edb.server.dbview import dbview
 log = logging.getLogger(__name__)
 
 
+class WasmRpcError(Exception):
+    def __init__(self, info):
+        super().__init__("Wasm request error")
+        self.__dict__.update(info)
+
+
 def handle_error(
     request: protocol.HttpRequest,
     response: protocol.HttpResponse,
@@ -37,19 +43,14 @@ def handle_error(
     response.close_connection = True
 
 
-async def proxy_request(
-    request: protocol.HttpRequest,
-    response: protocol.HttpResponse,
-    server  # : server.Server,  # circular import
-) -> None:
+async def rpc_request(
+    server,  # : server.Server,  # circular import
+    request: str,
+    params: dict,
+) -> dict:
     req_data = pickle.dumps(dict(
-        request="http",
-        params=dict(
-            method=bytes(request.method),
-            url=request.uri,
-            headers=request.headers,
-            body=request.body,
-        )
+        request=request,
+        params=params,
     ), protocol=5)
 
     loop = asyncio.get_running_loop()
@@ -64,16 +65,38 @@ async def proxy_request(
     resp_data = pickle.loads(await reader.read())
     match resp_data["response"]:
         case "success":
-            response.status = http.HTTPStatus(resp_data['status'])
-            headers = resp_data['headers']
-            response.content_type = headers.pop('content-type', None)
-            response.custom_headers = headers
-            response.body = resp_data['body']
+            return resp_data
         case "failure":
             log.error("Wasm request failed: %s", resp_data["error"])
-            response.status = http.HTTPStatus.INTERNAL_SERVER_ERROR
-            response.content_type = b"text/plain"
-            response.body = b"500 Internal Server Error"
+            raise WasmRpcError(resp_data)
+
+
+async def proxy_request(
+    request: protocol.HttpRequest,
+    response: protocol.HttpResponse,
+    server  # : server.Server,  # circular import
+) -> None:
+    try:
+        resp_data = await rpc_request(server, "http",
+            dict(
+                method=bytes(request.method),
+                url=request.uri,
+                headers=request.headers,
+                body=request.body,
+            )
+        )
+    except Exception as e:
+        if not isinstance(e, WasmRpcError):
+            log.exception("Error handing wasm RPC", exc_info=e)
+        response.status = http.HTTPStatus.INTERNAL_SERVER_ERROR
+        response.content_type = b"text/plain"
+        response.body = b"500 Internal Server Error"
+    else:
+        response.status = http.HTTPStatus(resp_data['status'])
+        headers = resp_data['headers']
+        response.content_type = headers.pop('content-type', None)
+        response.custom_headers = headers
+        response.body = resp_data['body']
 
 
 async def handle_request(

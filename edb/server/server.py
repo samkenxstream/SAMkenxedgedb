@@ -252,11 +252,17 @@ class Server(ha_base.ClusterProtocol):
 
         self._admin_ui = admin_ui
 
-    def _ensure_wasm(self):
+    def _ensure_wasm(self, dbname: str):
         if self._wasm_server is None:
             self._wasm_server = wasm.WasmServer(
+                self,
                 sock_path=pathlib.Path(self._runstate_dir) / '.s.wasm_ext',
             )
+        self._wasm_server.set_dir(
+            dbname,
+            # TODO(tailhook) is dbname always without slashes?
+            pathlib.Path(self._cluster.get_data_dir()) / 'wasm' / dbname,
+        )
 
     async def _request_stats_logger(self):
         last_seen = -1
@@ -752,7 +758,7 @@ class Server(ha_base.ClusterProtocol):
                 refresh=True,
             )
             if 'webassembly' in db.extensions:
-                self._ensure_wasm()
+                self._ensure_wasm(dbname)
         finally:
             self.release_pgcon(dbname, conn)
 
