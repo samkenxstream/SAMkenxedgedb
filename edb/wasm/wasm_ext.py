@@ -1,7 +1,7 @@
-import logging
 import asyncio
 import http
 import json
+import logging
 import pickle
 
 from functools import partial
@@ -43,7 +43,7 @@ def handle_error(
     response.close_connection = True
 
 
-async def rpc_request(
+async def rpc_request(  # type: ignore  # match statement
     server,  # : server.Server,  # circular import
     request: str,
     params: dict,
@@ -77,7 +77,9 @@ async def proxy_request(
     server  # : server.Server,  # circular import
 ) -> None:
     try:
-        resp_data = await rpc_request(server, "http",
+        resp_data = await rpc_request(
+            server,
+            "http",
             dict(
                 method=bytes(request.method),
                 url=request.uri,

@@ -60,7 +60,9 @@ class WasmServer:
             return
         log.info("Starting WebAssembly server")
         thisdir = pathlib.Path(__file__).parent
-        if self._sock_path.exists(): os.unlink(self._sock_path)
+
+        if self._sock_path.exists():
+            os.unlink(self._sock_path)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(str(self._sock_path))
         sock.listen()
@@ -82,12 +84,13 @@ class WasmServer:
     async def _config_task(self):
         while True:
             config = await self._config_queue.get()
-            match config:
+            match config:  # flake8: noqa (syntax is not supported yet)
                 case SetDirectory(database, directory):
-                    await wasm_ext.rpc_request(self._server(), "set_directory",
+                    await wasm_ext.rpc_request(
+                        self._server(),
+                        "set_directory",
                         dict(
-                            database=database,
-                            directory=directory,
+                            database=database,  # noqa: F821
+                            directory=directory,  # noqa: F821
                         )
                     )
-
