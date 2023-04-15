@@ -1,4 +1,5 @@
 .. eql:section-intro-page:: edgeql
+.. versioned-section::
 
 .. _ref_edgeql:
 
@@ -22,6 +23,7 @@ EdgeQL
     for
     group
     with
+    path_resolution
     transactions
 
 EdgeQL is a next-generation query language designed to match SQL in power and

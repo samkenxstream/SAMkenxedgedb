@@ -56,6 +56,7 @@ from edb.server import config
 from edb.server import compiler as edbcompiler
 from edb.server import defines as edbdef
 from edb.server import pgcluster
+from edb.server import pgcon
 
 from edb.pgsql import common as pg_common
 from edb.pgsql import dbops
@@ -70,8 +71,6 @@ from edgedb import scram
 
 if TYPE_CHECKING:
     import uuid
-
-    from edb.server import pgcon
 
 
 logger = logging.getLogger('edb.server')
@@ -606,13 +605,32 @@ def prepare_patch(
 
         # This part is wildly hinky
         # We need to delete all the support views and recreate them at the end
-        support_view_commands = metaschema.get_support_views(
-            reflschema, backend_params)
-        for cv in reversed(list(support_view_commands)):
-            dv = dbops.DropView(
-                cv.view.name,
-                conditions=[dbops.ViewExists(cv.view.name)],
+        support_view_commands = dbops.CommandGroup()
+        support_view_commands.add_commands([
+            dbops.CreateView(view)
+            for view in metaschema._generate_schema_alias_views(
+                reflschema, sn.UnqualName('schema')
             )
+        ])
+        support_view_commands.add_commands(
+            metaschema._generate_sql_information_schema())
+
+        for cv in reversed(list(support_view_commands)):
+            dv: Any
+            if isinstance(cv, dbops.CreateView):
+                dv = dbops.DropView(
+                    cv.view.name,
+                    conditions=[dbops.ViewExists(cv.view.name)],
+                )
+            elif isinstance(cv, dbops.CreateFunction):
+                dv = dbops.DropFunction(
+                    cv.function.name,
+                    args=cv.function.args or (),
+                    has_variadic=bool(cv.function.has_variadic),
+                    if_exists=True,
+                )
+            else:
+                raise AssertionError(f'unsupported support view command {cv}')
             dv.generate(preblock)
 
         support_view_commands.generate(subblock)
@@ -717,7 +735,8 @@ async def _make_stdlib(
         std_texts.append(s_std.get_std_module_text(modname))
 
     if testmode:
-        std_texts.append(s_std.get_std_module_text(sn.UnqualName('_testmode')))
+        for modname in s_schema.TESTMODE_SOURCES:
+            std_texts.append(s_std.get_std_module_text(modname))
 
     ddl_text = '\n'.join(std_texts)
     types: Set[uuid.UUID] = set()
@@ -727,10 +746,6 @@ async def _make_stdlib(
         assert isinstance(ddl_cmd, qlast.DDLCommand)
         delta_command = s_ddl.delta_from_ddl(
             ddl_cmd, modaliases={}, schema=schema, stdmode=True)
-
-        if debug.flags.delta_plan_input:
-            debug.header('Delta Plan Input')
-            debug.dump(delta_command)
 
         # Apply and adapt delta, build native delta plan, which
         # will also update the schema.
@@ -848,10 +863,6 @@ async def _amend_stdlib(
         assert isinstance(ddl_cmd, qlast.DDLCommand)
         delta_command = s_ddl.delta_from_ddl(
             ddl_cmd, modaliases={}, schema=schema, stdmode=True)
-
-        if debug.flags.delta_plan_input:
-            debug.header('Delta Plan Input')
-            debug.dump(delta_command)
 
         # Apply and adapt delta, build native delta plan, which
         # will also update the schema.
@@ -1066,12 +1077,13 @@ async def _init_stdlib(
 
     if not in_dev_mode and testmode:
         # Running tests on a production build.
-        stdlib, testmode_sql = await _amend_stdlib(
-            ctx,
-            s_std.get_std_module_text(sn.UnqualName('_testmode')),
-            stdlib,
-        )
-        await conn.sql_execute(testmode_sql.encode("utf-8"))
+        for modname in s_schema.TESTMODE_SOURCES:
+            stdlib, testmode_sql = await _amend_stdlib(
+                ctx,
+                s_std.get_std_module_text(modname),
+                stdlib,
+            )
+            await conn.sql_execute(testmode_sql.encode("utf-8"))
         # _testmode includes extra config settings, so make sure
         # those are picked up.
         config_spec = config.load_spec_from_schema(stdlib.stdschema)
@@ -1781,6 +1793,11 @@ async def _bootstrap(ctx: BootstrapContext) -> None:
             conn.add_log_listener(_pg_log_listener)
         else:
             tpl_ctx = ctx
+
+        # Some of the views need access to the _edgecon_state table,
+        # so set it up.
+        tmp_table_query = pgcon.SETUP_TEMP_TABLE_SCRIPT
+        await _execute(tpl_ctx.conn, tmp_table_query)
 
         await _populate_misc_instance_data(tpl_ctx)
 

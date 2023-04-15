@@ -353,6 +353,7 @@ def make_func_param(
 
 class Parameter(
     so.ObjectFragment,
+    so.Object,  # Help reflection figure out the right db MRO
     ParameterLike,
     qlkind=ft.SchemaObjectClass.PARAMETER,
     data_safe=True,
@@ -894,8 +895,7 @@ class CallableObject(
         return not isinstance(reference, Parameter)
 
 
-class CallableCommand(sd.QualifiedObjectCommand[CallableObjectT]):
-
+class ParametrizedCommand(sd.ObjectCommand[so.Object_T]):
     def _get_params(
         self,
         schema: s_schema.Schema,
@@ -962,6 +962,10 @@ class CallableCommand(sd.QualifiedObjectCommand[CallableObjectT]):
             params.append(param)
 
         return schema, params
+
+
+class CallableCommand(sd.QualifiedObjectCommand[CallableObjectT],
+                      ParametrizedCommand[CallableObjectT]):
 
     def canonicalize_attributes(
         self,
@@ -1195,6 +1199,7 @@ class Function(
     code = so.SchemaField(
         str, default=None, compcoef=0.4)
 
+    # Function body, when language is EdgeQL
     nativecode = so.SchemaField(
         s_expr.Expression, default=None, compcoef=0.9,
         reflection_name='body')
@@ -1662,7 +1667,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
             if (
                 self.has_attribute_value("code")
                 or self.has_attribute_value("nativecode")
-            ):
+            ) and not self.has_attribute_value('impl_is_strict'):
                 self.set_attribute_value(
                     'impl_is_strict',
                     _params_are_all_required_singletons(cp, schema),
@@ -1876,6 +1881,20 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                         f'{p_type.get_displayname(schema)}',
                         context=self.source_context)
 
+        # Make sure variadic parameters do not contain optional types in
+        # user-defined functions
+        if language == qlast.Language.EdgeQL:
+            if variadic := params.find_variadic(schema):
+                typemod = variadic.get_typemod(schema)
+                if typemod is ft.TypeModifier.OptionalType:
+                    raise errors.InvalidFunctionDefinitionError(
+                        f'cannot create the `{signature}` function: '
+                        f'variadic argument '
+                        f'`{variadic.get_displayname(schema)}` '
+                        f'illegally declared with optional type in '
+                        f'user-defined function',
+                        context=self.source_context)
+
         return schema
 
     @classmethod
@@ -1905,7 +1924,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                     nativecode_expr = astnode.nativecode
                 else:
                     assert astnode.code.code is not None
-                    nativecode_expr = qlparser.parse(astnode.code.code)
+                    nativecode_expr = qlparser.parse_query(astnode.code.code)
 
                 nativecode = s_expr.Expression.from_ast(
                     nativecode_expr,
@@ -2120,7 +2139,7 @@ class AlterFunction(AlterCallableObject[Function], FunctionCommand):
                 astnode.code.language is qlast.Language.EdgeQL
                 and astnode.code.code is not None
             ):
-                nativecode_expr = qlparser.parse(astnode.code.code)
+                nativecode_expr = qlparser.parse_query(astnode.code.code)
             else:
                 cmd.set_attribute_value(
                     'code',

@@ -34,6 +34,7 @@ from edb.schema import ddl as s_ddl
 from edb.schema import links as s_links
 from edb.schema import name as s_name
 from edb.schema import objtypes as s_objtypes
+from edb.schema import properties as s_props
 
 from edb.testbase import lang as tb
 from edb.tools import test
@@ -326,6 +327,20 @@ class TestSchema(tb.BaseSchemaLoadTest):
             };
         """
 
+    @tb.must_fail(
+        errors.InvalidLinkTargetError,
+        "required links may not use `on target delete deferred restrict`",
+    )
+    def test_schema_bad_link_05(self):
+        """
+            type A;
+            type Foo {
+                required link foo -> A {
+                    on target delete deferred restrict;
+                }
+            };
+        """
+
     @tb.must_fail(errors.InvalidPropertyTargetError,
                   "invalid property type: expected a scalar type, "
                   "or a scalar collection, got object type 'test::Object'",
@@ -532,6 +547,30 @@ class TestSchema(tb.BaseSchemaLoadTest):
     def test_schema_bad_type_15(self):
         """
             scalar type Foo;
+        """
+
+    @tb.must_fail(errors.InvalidDefinitionError,
+                  "index of object type 'test::Foo' was already declared")
+    def test_schema_bad_type_16(self):
+        """
+            type Foo {
+                property val -> str;
+                index on (.val);
+                index on (.val);
+            };
+        """
+
+    @tb.must_fail(errors.InvalidDefinitionError,
+                  "index 'fts::textsearch' of object type 'test::Foo' "
+                  "was already declared")
+    def test_schema_bad_type_17(self):
+        """
+            type Foo {
+                property val -> str;
+                index fts::textsearch(language:='enlgish') on (.val);
+                index fts::textsearch(language:='italian') on (.val);
+                index fts::textsearch(language:='enlgish') on (.val);
+            };
         """
 
     def test_schema_computable_cardinality_inference_01(self):
@@ -766,6 +805,19 @@ class TestSchema(tb.BaseSchemaLoadTest):
             module foo {
                 module ext {}
             }
+        """
+
+    @tb.must_fail(
+        errors.InvalidFunctionDefinitionError,
+        r"cannot create the `test::foo\(VARIADIC bar: "
+        r"OPTIONAL array<std::int64>\)` function: "
+        r"variadic argument `bar` illegally declared "
+        r"with optional type in user-defined function"
+    )
+    def test_schema_func_optional_variadic_01(self):
+        """
+            function foo(variadic bar: optional int64) -> array<int64>
+                using (assert_exists(bar));
         """
 
     def test_schema_refs_01(self):
@@ -1332,7 +1384,7 @@ class TestSchema(tb.BaseSchemaLoadTest):
             CREATE MODULE default;
             CREATE TYPE default::A;
             CREATE TYPE default::B EXTENDING A;
-            CREATE TYPE default::C EXTENDING A, B;
+            CREATE TYPE default::C EXTENDING B, A;
         ''')
 
         orig_get_children = type(schema).get_children
@@ -1485,7 +1537,7 @@ class TestSchema(tb.BaseSchemaLoadTest):
             next(iter(obj.get_indexes(
                 schema).objects(schema))).get_verbosename(
                     schema, with_parent=True),
-            "index 'foo_7770702d' of object type 'test::Object1'",
+            "index of object type 'test::Object1'",
         )
 
     def test_schema_advanced_types(self):
@@ -3174,6 +3226,23 @@ class TestGetMigration(tb.BaseSchemaLoadTest):
 
         self._assert_migration_consistency(schema)
 
+    def test_schema_get_migration_54(self):
+        schema = r'''
+            type Venue {
+                multi link meta_bookings := .<venue[is MetaBooking];
+            }
+            abstract type MetaBooking {
+                link venue -> Venue;
+            }
+
+            type Booking extending MetaBooking;
+            type ExternalBooking extending MetaBooking {
+                overloaded link venue -> Venue;
+            }
+        '''
+
+        self._assert_migration_consistency(schema)
+
     def test_schema_get_migration_multi_module_01(self):
         schema = r'''
             # The two declared types declared are from different
@@ -3503,6 +3572,36 @@ class TestGetMigration(tb.BaseSchemaLoadTest):
         '''
 
         self._assert_migration_consistency(schema)
+
+    def test_schema_pointer_kind_infer_01(self):
+        tschema = r'''
+        type Bar;
+        scalar type scl extending str;
+        abstract link friendship {
+            property strength: float64;
+            index on (__subject__@strength);
+        };
+        type Foo {
+            name: str;
+            foo: Foo;
+            bar: Bar;
+            bar2 extending friendship: Bar;
+            or_: Foo | Bar;
+            array1: array<str>;
+            array2: array<scl>;
+        };
+        '''
+
+        schema = self._assert_migration_consistency(tschema)
+
+        obj = schema.get('default::Foo')
+        obj.getptr(schema, s_name.UnqualName('name'), type=s_props.Property)
+        obj.getptr(schema, s_name.UnqualName('array1'), type=s_props.Property)
+        obj.getptr(schema, s_name.UnqualName('array2'), type=s_props.Property)
+        obj.getptr(schema, s_name.UnqualName('foo'), type=s_links.Link)
+        obj.getptr(schema, s_name.UnqualName('bar'), type=s_links.Link)
+        obj.getptr(schema, s_name.UnqualName('bar2'), type=s_links.Link)
+        obj.getptr(schema, s_name.UnqualName('or_'), type=s_links.Link)
 
     def test_schema_migrations_equivalence_01(self):
         self._assert_migration_equivalence([r"""
@@ -5909,7 +6008,7 @@ class TestGetMigration(tb.BaseSchemaLoadTest):
                 property last_name -> str;
                 property name := .first_name ++ ' ' ++ .last_name;
                 # an index on a computable
-                index on (.name);
+                index fts::textsearch(language := 'english') on (.name);
             }
         """])
 
@@ -7693,7 +7792,7 @@ class TestGetMigration(tb.BaseSchemaLoadTest):
                 abstract type C extending B;
                 abstract type C2 extending C;
                 abstract type D;
-                type F extending C, C2, B;
+                type F extending C2, C, B;
             """,
             r"""
             """,
@@ -7725,8 +7824,8 @@ class TestGetMigration(tb.BaseSchemaLoadTest):
                 abstract type C extending B;
                 abstract type C2 extending C;
                 abstract type D;
-                type F extending C, C2, B;
-                type F2 extending C, C2, B, F;
+                type F extending C2, C, B;
+                type F2 extending F, C2, C, B;
             """,
             r"""
             """,
@@ -7773,7 +7872,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
         tests = [iter(tests)] * 2
 
         for stmt_text, expected_output in zip(*tests):
-            qltree = qlparser.parse(stmt_text, {None: 'test'})
+            qltree = qlparser.parse_command(stmt_text, {None: 'test'})
             stmt = qlcompiler.compile_ast_to_ir(
                 qltree,
                 schema,
@@ -7842,7 +7941,8 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             """
             type test::Child extending test::Parent, test::Parent2 {
                 annotation test::anno := 'annotated';
-                overloaded link foo extending test::f -> test::Foo {
+                overloaded link foo: test::Foo {
+                    extending test::f;
                     annotation test::anno := 'annotated link';
                     constraint std::exclusive {
                         annotation test::anno := 'annotated constraint';
@@ -7857,23 +7957,24 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             type test::Child extending test::Parent, test::Parent2 {
                 annotation test::anno := 'annotated';
                 index on (.foo);
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                overloaded single link foo extending test::f -> test::Foo {
+                overloaded single link foo: test::Foo {
+                    extending test::f;
                     annotation test::anno := 'annotated link';
                     constraint std::exclusive {
                         annotation test::anno := 'annotated constraint';
                     };
-                    optional single property p -> test::int_t {
+                    optional single property p: test::int_t {
                         constraint std::max_value(10);
                     };
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                     constraint std::exclusive;
                 };
-                optional multi property name -> std::str;
+                optional multi property name: std::str;
             };
             """,
 
@@ -7881,16 +7982,17 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             type test::Child extending test::Parent, test::Parent2 {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                overloaded single link foo extending test::f -> test::Foo {
-                    optional single property p -> test::int_t;
+                overloaded single link foo: test::Foo {
+                    extending test::f;
+                    optional single property p: test::int_t;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                 };
-                optional multi property name -> std::str;
+                optional multi property name: std::str;
             };
             """,
 
@@ -7960,12 +8062,12 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             [
                 """
                 type test::Spam {
-                    link foobar -> (test::Foo | test::Bar);
+                    link foobar: (test::Foo | test::Bar);
                 };
                 """,
                 """
                 type test::Spam {
-                    link foobar -> (test::Bar | test::Foo);
+                    link foobar: (test::Bar | test::Foo);
                 };
                 """,
             ]
@@ -8022,13 +8124,13 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             type test::Foo {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                 };
-                required single property middle_name -> std::str {
+                required single property middle_name: std::str {
                     default := 'abc';
                     readonly := true;
                 };
@@ -8039,14 +8141,14 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             type test::Foo {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                     constraint std::exclusive;
                 };
-                required single property middle_name -> std::str {
+                required single property middle_name: std::str {
                     default := 'abc';
                     readonly := true;
                 };
@@ -8057,14 +8159,14 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             type test::Bar extending test::Foo {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
 
                     readonly := true;
                 };
-                required single property middle_name -> std::str {
+                required single property middle_name: std::str {
                     default := 'abc';
                     readonly := true;
                 };
@@ -8075,7 +8177,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             type test::Foo {
-                required single property middle_name -> std::str {
+                required single property middle_name: std::str {
                     default := 'abc';
                     readonly := true;
                 };
@@ -8107,15 +8209,15 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             """
             type test::User extending test::HasImage {
                 index on (__subject__.image);
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                     constraint std::exclusive;
                 };
-                required single property image -> std::str;
-                optional single property name -> std::str;
+                required single property image: std::str;
+                optional single property name: std::str;
             };
             """,
 
@@ -8123,14 +8225,14 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             type test::User extending test::HasImage {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                 };
-                required single property image -> std::str;
-                optional single property name -> std::str;
+                required single property image: std::str;
+                optional single property name: std::str;
             };
             """,
 
@@ -8138,7 +8240,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             type test::User extending test::HasImage {
-                property name -> std::str;
+                property name: std::str;
             };
             ''',
 
@@ -8147,14 +8249,14 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             '''
             abstract type test::HasImage {
                 index on (__subject__.image);
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                     constraint std::exclusive;
                 };
-                required single property image -> std::str;
+                required single property image: std::str;
             };
             ''',
 
@@ -8162,13 +8264,13 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             abstract type test::HasImage {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                 };
-                required single property image -> std::str;
+                required single property image: std::str;
             };
             ''',
 
@@ -8177,7 +8279,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             '''
             abstract type test::HasImage {
                 index on (__subject__.image);
-                required property image -> std::str;
+                required property image: std::str;
             };
             ''',
 
@@ -8185,7 +8287,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             CREATE ABSTRACT TYPE test::HasImage {
-                CREATE REQUIRED PROPERTY image -> std::str;
+                CREATE REQUIRED PROPERTY image: std::str;
                 CREATE INDEX ON (__subject__.image);
             };
             '''
@@ -8247,8 +8349,8 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             type test::UniqueName {
-                link translated_label extending test::translated_label
-                        -> test::Label {
+                link translated_label: test::Label {
+                    extending test::translated_label;
                     constraint std::exclusive on (__subject__@prop1);
                     constraint std::exclusive on (
                         (__subject__@source, __subject__@lang)
@@ -8261,17 +8363,15 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             type test::UniqueName {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                optional single link translated_label
-                extending test::translated_label
-                    -> test::Label
-                {
-                    optional single property lang -> std::str;
-                    optional single property prop1 -> std::str;
+                optional single link translated_label: test::Label {
+                    extending test::translated_label;
+                    optional single property lang: std::str;
+                    optional single property prop1: std::str;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                 };
             };
@@ -8281,20 +8381,18 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             type test::UniqueName {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                optional single link translated_label
-                extending test::translated_label
-                    -> test::Label
-                {
+                optional single link translated_label: test::Label {
+                    extending test::translated_label;
                     constraint std::exclusive on (__subject__@prop1);
                     constraint std::exclusive on (
                         (__subject__@source, __subject__@lang));
-                    optional single property lang -> std::str;
-                    optional single property prop1 -> std::str;
+                    optional single property lang: std::str;
+                    optional single property prop1: std::str;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                     constraint std::exclusive;
                 };
@@ -8359,7 +8457,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             CREATE TYPE test::Foo {
-                CREATE PROPERTY bar -> std::str {
+                CREATE PROPERTY bar: std::str {
                     SET readonly := false;
                 };
             };
@@ -8368,7 +8466,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             type test::Foo {
-                property bar -> std::str {
+                property bar: std::str {
                     readonly := false;
                 };
             };
@@ -8506,7 +8604,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             type test::Bar0 {
-                link insert_foo -> test::Foo {
+                link insert_foo: test::Foo {
                     default := (INSERT
                         test::Foo
                         {
@@ -8519,7 +8617,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             type test::Bar1 {
-                multi link update_foo -> test::Foo {
+                multi link update_foo: test::Foo {
                     default := (UPDATE
                         test::Foo
                     FILTER
@@ -8534,7 +8632,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             type test::Bar2 {
-                multi link for_foo -> test::Foo {
+                multi link for_foo: test::Foo {
                     default := (FOR x IN {2, 3}
                     UNION
                         (SELECT
@@ -8549,7 +8647,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             '''
             type test::Bar3 {
-                property delete_foo -> std::int64 {
+                property delete_foo: std::int64 {
                     default := (SELECT
                         ((DELETE
                             test::Foo
@@ -8578,7 +8676,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             CREATE TYPE test::Foo {
-                CREATE PROPERTY name -> std::str;
+                CREATE PROPERTY name: std::str;
             };
             CREATE ALIAS test::Bar := (
                 SELECT test::Foo {
@@ -8606,7 +8704,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             CREATE TYPE test::Foo {
-                CREATE PROPERTY name -> std::str;
+                CREATE PROPERTY name: std::str;
             };
             CREATE ALIAS test::Bar {
                 USING (
@@ -8672,7 +8770,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             CREATE TYPE test::Foo {
-                CREATE PROPERTY name -> std::str;
+                CREATE PROPERTY name: std::str;
             };
             CREATE ALIAS test::Bar := (
                 SELECT test::Foo {
@@ -8772,7 +8870,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             CREATE TYPE test::Foo {
-                CREATE PROPERTY name -> std::str;
+                CREATE PROPERTY name: std::str;
                 CREATE PROPERTY comp := (WITH
                     x :=
                         std::count(std::Object)
@@ -8793,19 +8891,19 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             # the links order is non-deterministic
             """
             CREATE TYPE schema::ObjectType
-            EXTENDING schema::InheritingObject,
+            EXTENDING schema::Source,
                       schema::ConsistencySubject,
-                      schema::AnnotationSubject,
+                      schema::InheritingObject,
                       schema::Type,
-                      schema::Source
+                      schema::AnnotationSubject
             {
-                CREATE MULTI LINK access_policies
-                  EXTENDING schema::reference -> schema::AccessPolicy {
+                CREATE MULTI LINK access_policies: schema::AccessPolicy {
+                    EXTENDING schema::reference;
                     ON TARGET DELETE ALLOW;
                     CREATE CONSTRAINT std::exclusive;
                 };
-                CREATE MULTI LINK intersection_of -> schema::ObjectType;
-                CREATE MULTI LINK union_of -> schema::ObjectType;
+                CREATE MULTI LINK intersection_of: schema::ObjectType;
+                CREATE MULTI LINK union_of: schema::ObjectType;
                 CREATE PROPERTY compound_type := (
                     (EXISTS (.union_of) OR EXISTS (.intersection_of))
                 );
@@ -8816,8 +8914,8 @@ class TestDescribe(tb.BaseSchemaLoadTest):
                 CREATE MULTI LINK properties := (
                     .pointers[IS schema::Property]
                 );
-                CREATE MULTI LINK triggers
-                  EXTENDING schema::reference -> schema::Trigger {
+                CREATE MULTI LINK triggers: schema::Trigger {
+                    EXTENDING schema::reference;
                     ON TARGET DELETE ALLOW;
                     CREATE CONSTRAINT std::exclusive;
                 };
@@ -8827,29 +8925,29 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             'DESCRIBE TYPE schema::ObjectType AS SDL',
 
             """
-            type schema::ObjectType extending
-                    schema::InheritingObject,
-                    schema::ConsistencySubject,
-                    schema::AnnotationSubject,
-                    schema::Type,
-                    schema::Source
+            type schema::ObjectType
+            extending schema::Source,
+                      schema::ConsistencySubject,
+                      schema::InheritingObject,
+                      schema::Type,
+                      schema::AnnotationSubject
             {
-                multi link access_policies
-                  extending schema::reference -> schema::AccessPolicy {
+                multi link access_policies: schema::AccessPolicy {
+                    extending schema::reference;
                     on target delete allow;
                     constraint std::exclusive;
                 };
-                multi link intersection_of -> schema::ObjectType;
+                multi link intersection_of: schema::ObjectType;
                 multi link links := (.pointers[IS schema::Link]);
                 multi link properties := (
                     .pointers[IS schema::Property]
                 );
-                multi link triggers
-                  extending schema::reference -> schema::Trigger {
+                multi link triggers: schema::Trigger {
+                    extending schema::reference;
                     on target delete allow;
                     constraint std::exclusive;
                 };
-                multi link union_of -> schema::ObjectType;
+                multi link union_of: schema::ObjectType;
                 property compound_type := (
                     (EXISTS (.union_of) OR EXISTS (.intersection_of))
                 );
@@ -8887,7 +8985,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             CREATE TYPE test::Foo {
-                CREATE LINK bar -> std::Object {
+                CREATE LINK bar: std::Object {
                     ON TARGET DELETE ALLOW;
                 };
             };
@@ -8897,7 +8995,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             type test::Foo {
-                link bar -> std::Object {
+                link bar: std::Object {
                     on target delete  allow;
                 };
             };
@@ -8907,13 +9005,13 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             type test::Foo {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                optional single link bar -> std::Object {
+                optional single link bar: std::Object {
                     on target delete  allow;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                 };
             };
@@ -8966,22 +9064,22 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             type test::Object {
-                required single link __type__ -> schema::ObjectType {
+                required single link __type__: schema::ObjectType {
                     readonly := true;
                 };
-                required single property id -> std::uuid {
+                required single property id: std::uuid {
                     readonly := true;
                 };
-                optional single property real -> std::bool;
+                optional single property real: std::bool;
             };
 
             # The following builtins are masked by the above:
 
             # abstract type std::Object extending std::BaseObject {
-            #     required single link __type__ -> schema::ObjectType {
+            #     required single link __type__: schema::ObjectType {
             #         readonly := true;
             #     };
-            #     required single property id -> std::uuid {
+            #     required single property id: std::uuid {
             #         readonly := true;
             #     };
             # };
@@ -9008,9 +9106,9 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             CREATE TYPE test::Tree {
-                CREATE LINK parent -> test::Tree;
+                CREATE LINK parent: test::Tree;
                 CREATE MULTI LINK children := (.<parent[IS test::Tree]);
-                CREATE REQUIRED PROPERTY val -> std::str {
+                CREATE REQUIRED PROPERTY val: std::str {
                     CREATE CONSTRAINT std::exclusive;
                 };
                 CREATE MULTI LINK test_comp := (
@@ -9073,17 +9171,17 @@ class TestDescribe(tb.BaseSchemaLoadTest):
                 CREATE CONSTRAINT std::max_value(15);
             };
             CREATE ABSTRACT LINK test::f {
-                CREATE PROPERTY p -> test::int_t {
+                CREATE PROPERTY p: test::int_t {
                     CREATE CONSTRAINT std::max_value(10);
                     CREATE ANNOTATION test::anno := 'annotated link property';
                 };
             };
             CREATE TYPE test::Foo;
             CREATE TYPE test::Parent {
-                CREATE MULTI PROPERTY name -> std::str;
+                CREATE MULTI PROPERTY name: std::str;
             };
             CREATE TYPE test::Parent2 {
-                CREATE LINK foo -> test::Foo;
+                CREATE LINK foo: test::Foo;
                 CREATE INDEX ON (.foo);
             };
             CREATE TYPE test::Child EXTENDING test::Parent, test::Parent2 {
@@ -9107,7 +9205,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             module test {
                 abstract annotation anno;
                 abstract link f {
-                    property p -> test::int_t {
+                    property p: test::int_t {
                         annotation test::anno := 'annotated link property';
                         constraint std::max_value(10);
                     };
@@ -9118,7 +9216,8 @@ class TestDescribe(tb.BaseSchemaLoadTest):
                 };
                 type Child extending test::Parent, test::Parent2 {
                     annotation test::anno := 'annotated';
-                    overloaded link foo extending test::f -> test::Foo {
+                    overloaded link foo: test::Foo {
+                        extending test::f;
                         annotation test::anno := 'annotated link';
                         constraint std::exclusive {
                             annotation test::anno := 'annotated constraint';
@@ -9127,11 +9226,11 @@ class TestDescribe(tb.BaseSchemaLoadTest):
                 };
                 type Foo;
                 type Parent {
-                    multi property name -> std::str;
+                    multi property name: std::str;
                 };
                 type Parent2 {
                     index on (.foo);
-                    link foo -> test::Foo;
+                    link foo: test::Foo;
                 };
             };
             """,
@@ -9161,10 +9260,10 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             CREATE EXTENSION NOTEBOOK VERSION '1.0';
             CREATE TYPE default::Foo;
             CREATE TYPE test::Bar {
-                CREATE LINK foo -> default::Foo;
+                CREATE LINK foo: default::Foo;
             };
             ALTER TYPE default::Foo {
-                CREATE LINK bar -> test::Bar;
+                CREATE LINK bar: test::Bar;
             };
             """,
 
@@ -9174,12 +9273,12 @@ class TestDescribe(tb.BaseSchemaLoadTest):
             using extension notebook version '1.0';
             module default {
                 type Foo {
-                    link bar -> test::Bar;
+                    link bar: test::Bar;
                 };
             };
             module test {
                 type Bar {
-                    link foo -> default::Foo;
+                    link foo: default::Foo;
                 };
             };
             """,
@@ -9206,7 +9305,7 @@ class TestDescribe(tb.BaseSchemaLoadTest):
 
             """
             create type test::ExceptTest {
-                create property e -> std::bool;
+                create property e: std::bool;
                 create constraint std::expression on (true) except (.e);
                 create constraint test::always_ok on (.e) except (.e);
                 create constraint test::always_ok on (.e);

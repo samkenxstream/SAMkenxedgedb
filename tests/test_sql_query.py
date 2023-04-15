@@ -16,6 +16,8 @@
 # limitations under the License.
 #
 
+import csv
+import io
 import os.path
 
 from edb.testbase import server as tb
@@ -23,12 +25,12 @@ from edb.tools import test
 
 try:
     import asyncpg
+    from asyncpg import serverversion
 except ImportError:
     pass
 
 
 class TestSQL(tb.SQLQueryTestCase):
-
     SCHEMA = os.path.join(os.path.dirname(__file__), 'schemas', 'movies.esdl')
     SCHEMA_INVENTORY = os.path.join(
         os.path.dirname(__file__), 'schemas', 'inventory.esdl'
@@ -541,10 +543,9 @@ class TestSQL(tb.SQLQueryTestCase):
             ORDER BY title
             """
         )
-        self.assertEqual(res, [
-            ['Forrest Gump', 1],
-            ['Saving Private Ryan', 1]
-        ])
+        self.assertEqual(
+            res, [['Forrest Gump', 1], ['Saving Private Ryan', 1]]
+        )
 
     async def test_sql_query_36(self):
         # ColumnRef to relation
@@ -555,6 +556,14 @@ class TestSQL(tb.SQLQueryTestCase):
             """
         )
         self.assertEqual(res, [[(1, 2)]])
+
+    async def test_sql_query_37(self):
+        res = await self.squery_values(
+            """
+            SELECT (pg_column_size(ROW()))::text
+            """
+        )
+        self.assertEqual(res, [['24']])
 
     async def test_sql_query_introspection_00(self):
         res = await self.squery_values(
@@ -666,6 +675,18 @@ class TestSQL(tb.SQLQueryTestCase):
             except Exception:
                 raise Exception(f'introspecting {table_name}')
 
+    async def test_sql_query_introspection_03(self):
+        [[toast_table]] = await self.squery_values(
+            '''
+            SELECT relname FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'pg_toast'
+            ORDER BY relname LIMIT 1
+            '''
+        )
+        # Result will probably be empty, so we cannot validate column names
+        await self.squery_values(f'SELECT * FROM pg_toast.{toast_table}')
+
     async def test_sql_query_schemas(self):
         await self.scon.fetch('SELECT id FROM "inventory"."Item";')
         await self.scon.fetch('SELECT id FROM "public"."Person";')
@@ -703,7 +724,7 @@ class TestSQL(tb.SQLQueryTestCase):
         # HACK: Set search_path back to public
         await self.scon.execute('SET search_path TO public;')
 
-    async def test_sql_query_static_eval(self):
+    async def test_sql_query_static_eval_01(self):
         res = await self.squery_values('select current_schema;')
         self.assertEqual(res, [['public']])
 
@@ -721,19 +742,56 @@ class TestSQL(tb.SQLQueryTestCase):
         res = await self.squery_values('select current_schemas(true);')
         self.assertEqual(res, [[['pg_catalog', 'blah', 'foo']]])
 
+    async def test_sql_query_static_eval_02(self):
+        await self.scon.execute(
+            '''
+            SELECT nspname as table_schema,
+                relname as table_name
+            FROM   pg_class c
+            JOIN   pg_namespace n on c.relnamespace = n.oid
+            WHERE  has_table_privilege(c.oid, 'SELECT')
+            AND    has_schema_privilege(current_user, nspname, 'USAGE')
+            AND    relkind in ('r', 'm', 'v', 't', 'f', 'p')
+            '''
+        )
+
+    async def test_sql_query_static_eval_03(self):
+        await self.scon.execute(
+            '''
+            SELECT information_schema._pg_truetypid(a.*, t.*)
+            FROM pg_attribute a
+            JOIN pg_type t ON t.oid = a.atttypid
+            '''
+        )
+
+    async def test_sql_query_static_eval_04(self):
+        [[res1, res2]] = await self.squery_values(
+            '''
+            SELECT to_regclass('"Movie.actors"'),
+                '"public"."Movie.actors"'::regclass
+            '''
+        )
+        self.assertEqual(res1, res2)
+        assert isinstance(res1, int)
+        assert isinstance(res2, int)
+
     async def test_sql_query_be_state(self):
         con = await self.connect(database=self.con.dbname)
         try:
-            await con.execute('''
+            await con.execute(
+                '''
                 CONFIGURE SESSION SET __internal_sess_testvalue := 1;
-            ''')
+                '''
+            )
             await self.squery_values(
                 "set default_transaction_isolation to 'read committed'"
             )
             self.assertEqual(
-                await con.query_single('''
+                await con.query_single(
+                    '''
                     SELECT assert_single(cfg::Config.__internal_sess_testvalue)
-                '''),
+                    '''
+                ),
                 1,
             )
             res = await self.squery_values(
@@ -759,3 +817,55 @@ class TestSQL(tb.SQLQueryTestCase):
         await self.squery_values("set client_encoding to 'latin1'")
         with self.assertRaises(asyncpg.UntranslatableCharacterError):
             await self.squery_values('select * from "Genre"')
+
+    async def test_sql_query_server_version(self):
+        version = await self.scon.fetchval("show server_version")
+        self.assertEqual(
+            self.scon.get_server_version(),
+            serverversion.split_server_version_string(version),
+        )
+        with self.assertRaises(asyncpg.CantChangeRuntimeParamError):
+            await self.squery_values("set server_version to blah")
+        with self.assertRaises(asyncpg.CantChangeRuntimeParamError):
+            await self.squery_values("reset server_version")
+
+    async def test_sql_query_server_version_num(self):
+        await self.squery_values("show server_version_num")
+        with self.assertRaises(asyncpg.CantChangeRuntimeParamError):
+            await self.squery_values("set server_version_num to blah")
+        with self.assertRaises(asyncpg.CantChangeRuntimeParamError):
+            await self.squery_values("reset server_version_num")
+
+    async def test_sql_query_version(self):
+        version = await self.scon.fetchrow("select version()")
+        self.assertTrue(version["version"].startswith("PostgreSQL "))
+        self.assertIn("EdgeDB", version["version"])
+
+    async def test_sql_transaction_01(self):
+        await self.scon.execute(
+            """
+            BEGIN;
+            SELECT * FROM "Genre" ORDER BY id;
+            COMMIT;
+            """,
+        )
+
+    async def test_sql_transaction_02(self):
+        await self.scon.execute("BEGIN")
+        await self.scon.execute(
+            "SET TRANSACTION ISOLATION LEVEL read uncommitted"
+        )
+        v1 = await self.scon.fetchval("SHOW transaction_isolation")
+        self.assertEqual(v1, "read uncommitted")
+        await self.scon.execute("ROLLBACK")
+        v2 = await self.scon.fetchval("SHOW transaction_isolation")
+        self.assertNotEqual(v1, v2)
+
+    async def test_sql_query_copy_01(self):
+        out = io.BytesIO()
+        await self.scon.copy_from_table(
+            "Movie", output=out, format="csv", delimiter="\t"
+        )
+        out = io.StringIO(out.getvalue().decode("utf-8"))
+        names = set(row[6] for row in csv.reader(out, delimiter="\t"))
+        self.assertEqual(names, {"Forrest Gump", "Saving Private Ryan"})

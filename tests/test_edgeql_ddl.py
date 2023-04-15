@@ -2096,6 +2096,45 @@ class TestEdgeQLDDL(tb.DDLTestCase):
                 };
             ''')
 
+    async def test_edgeql_ddl_link_target_bad_05(self):
+        with self.assertRaisesRegex(
+            edgedb.InvalidLinkTargetError,
+            r"invalid link target type, expected object type, got.+array",
+            _hint="did you mean 'multi link bar -> default::Foo'?",
+        ):
+            await self.con.execute('''
+                create type Foo {
+                    create link bar -> array<Foo>;
+                };
+            ''')
+
+    async def test_edgeql_ddl_link_target_bad_06(self):
+        with self.assertRaisesRegex(
+            edgedb.InvalidLinkTargetError,
+            r"invalid link target type, expected object type, got.+array",
+            _hint="did you mean 'multi link bar -> default::Foo'?",
+        ):
+            await self.con.execute('''
+                create type Foo {
+                    create multi link bar -> array<Foo>;
+                };
+            ''')
+
+    async def test_edgeql_ddl_link_target_bad_07(self):
+        with self.assertRaisesRegex(
+            edgedb.InvalidLinkTargetError,
+            r"required links may not use `on target delete deferred"
+            r" restrict`",
+        ):
+            await self.con.execute('''
+                create type A;
+                create type Foo {
+                    create required link bar -> A {
+                        on target delete deferred restrict;
+                    };
+                };
+            ''')
+
     async def test_edgeql_ddl_link_target_merge_01(self):
         await self.con.execute('''
 
@@ -3266,6 +3305,17 @@ class TestEdgeQLDDL(tb.DDLTestCase):
                 }
             """)
 
+    async def test_edgeql_ddl_ptr_set_required_02(self):
+        await self.con.execute(
+            r"""
+            create type X { create required multi property foo -> str };
+            insert X { foo := "test" };
+            alter type X alter property foo set single
+                using (assert_single(.foo));
+            """
+        )
+        await self.assert_query_result("select X { foo }", [{"foo": "test"}])
+
     async def test_edgeql_ddl_link_property_01(self):
         with self.assertRaisesRegex(
                 edgedb.InvalidPropertyDefinitionError,
@@ -3425,6 +3475,27 @@ class TestEdgeQLDDL(tb.DDLTestCase):
             # The python bindings seem to misbehave when there is
             # linkprop and a regular prop with the same name
             json_only=True,
+        )
+
+    async def test_edgeql_ddl_link_property_10(self):
+        await self.con.execute("""
+            CREATE TYPE default::User;
+            CREATE TYPE default::Survey {
+                CREATE MULTI LINK recipients -> default::User;
+            };
+            insert Survey { recipients := (insert User) };
+        """)
+
+        await self.con.execute("""
+            alter type Survey alter link recipients
+            create property destination -> str { set default := "email" };
+        """)
+
+        await self.assert_query_result(
+            r"""
+                select Survey { recipients: {@destination} };
+            """,
+            [{"recipients": [{"@destination": "email"}]}]
         )
 
     async def test_edgeql_ddl_bad_01(self):
@@ -3634,6 +3705,17 @@ class TestEdgeQLDDL(tb.DDLTestCase):
                 await self.migrate("""
                     abstract link bar {
                         default := Object;
+                    };
+                """)
+
+    async def test_edgeql_ddl_link_bad_05(self):
+        with self.assertRaisesRegex(
+                edgedb.EdgeQLSyntaxError,
+                f'specifying EXTENDING twice is not allowed'):
+            async with self.con.transaction():
+                await self.con.execute("""
+                    CREATE ABSTRACT LINK Foo extending Bar {
+                        EXTENDING Bar;
                     };
                 """)
 
@@ -4731,6 +4813,20 @@ class TestEdgeQLDDL(tb.DDLTestCase):
                 $$;
             """)
 
+    async def test_edgeql_ddl_function_36(self):
+        with self.assertRaisesRegex(
+            edgedb.InvalidFunctionDefinitionError,
+            r"cannot create the `default::broken_edgeql_func36\("
+            r"VARIADIC foo: OPTIONAL array<std::int64>\)` function: "
+            r"variadic argument `foo` illegally declared with "
+            r"optional type in user-defined function"
+        ):
+            await self.con.execute(r"""
+                CREATE FUNCTION broken_edgeql_func36(
+                    variadic foo: optional std::int64) -> array<std::int64>
+                USING (assert_exists(foo));
+            """)
+
     async def test_edgeql_ddl_function_rename_01(self):
         await self.con.execute("""
             CREATE FUNCTION foo(s: str) -> str {
@@ -5182,6 +5278,18 @@ class TestEdgeQLDDL(tb.DDLTestCase):
                     SET fallback := true;
                 };
             ''')
+
+    async def test_edgeql_ddl_function_splat_01(self):
+        with self.assertRaisesRegex(
+            edgedb.UnsupportedFeatureError,
+            r'splat operators in function bodies are not supported',
+        ):
+            async with self.con.transaction():
+                await self.con.execute("""
+                    CREATE FUNCTION my_splat() -> std::json USING (
+                        SELECT <json>Object { ** } LIMIT 1
+                    );
+                """)
 
     async def test_edgeql_ddl_module_01(self):
         with self.assertRaisesRegex(
@@ -6479,25 +6587,9 @@ class TestEdgeQLDDL(tb.DDLTestCase):
             create type X;
         """)
 
-        # We can't set a default that uses a global when creating a new
-        # pointer, since it would need to run *now* and populate the data
-        async with self.assertRaisesRegexTx(
-            edgedb.UnsupportedFeatureError,
-            r"globals may not be used when converting/populating data "
-            r"in migrations"
-        ):
-            await self.con.execute("""
-                alter type X {
-                    create property foo -> str {
-                        set default := (global foo);
-                    }
-                };
-            """)
-
         await self.con.execute("""
             set global foo := "test"
         """)
-        # But we *can* do it when creating a brand new type
         await self.con.execute("""
             create type Y {
                 create property foo -> str {
@@ -6742,6 +6834,61 @@ class TestEdgeQLDDL(tb.DDLTestCase):
             await self.con.execute("""
                 alter global foo set type str using ('lol');
             """)
+
+    async def test_edgeql_ddl_global_default(self):
+        await self.con.execute('''
+            create global foo -> str;
+            create type Foo;
+        ''')
+
+        # Should work; no data in the table to cause trouble
+        await self.con.execute('''
+            alter type Foo { create required property name -> str {
+                set default := (global foo);
+            } }
+        ''')
+
+        await self.con.execute('''
+            set global foo := "test";
+            insert Foo;
+            reset global foo;
+        ''')
+
+        await self.assert_query_result(
+            '''
+                select Foo { name }
+            ''',
+            [{'name': "test"}],
+        )
+
+        # Should fail because there is data
+        async with self.assertRaisesRegexTx(
+            edgedb.MissingRequiredError,
+            r"missing value for required property"
+        ):
+            await self.con.execute('''
+                alter type Foo { create required property name2 -> str {
+                    set default := (global foo);
+                } }
+            ''')
+
+        await self.con.execute('''
+            alter global foo set default := "!";
+        ''')
+
+        # Try it again now that there is a default
+        await self.con.execute('''
+            alter type Foo { create required property name2 -> str {
+                set default := (global foo);
+            } }
+        ''')
+
+        await self.assert_query_result(
+            '''
+                select Foo { name, name2 }
+            ''',
+            [{'name': "test", 'name2': "!"}],
+        )
 
     async def test_edgeql_ddl_property_computable_01(self):
         await self.con.execute('''\
@@ -7822,7 +7969,7 @@ type default::Foo {
     async def test_edgeql_ddl_extending_01(self):
         with self.assertRaisesRegex(
                 edgedb.SchemaError,
-                r"Could not find consistent ancestor order for "
+                r"could not find consistent ancestor order for "
                 r"object type 'default::Merged1'"):
 
             await self.con.execute(r"""
@@ -7836,17 +7983,17 @@ type default::Foo {
             """)
 
     async def test_edgeql_ddl_extending_02(self):
-        await self.con.execute(r"""
-            CREATE TYPE ExtA2;
-            # Create two types with a different position of Object
-            # in the bases. This doesn't impact the linearized
-            # bases because Object is already implicitly included
-            # as the first element of the base types.
-            CREATE TYPE ExtC2 EXTENDING ExtA2, Object;
-            CREATE TYPE ExtD2 EXTENDING Object, ExtA2;
-            # extending from both of these types
-            CREATE TYPE Merged2 EXTENDING ExtC2, ExtD2;
-        """)
+        with self.assertRaisesRegex(
+                edgedb.SchemaError,
+                r"could not find consistent ancestor order for "
+                r"object type 'default::ExtD2'"):
+            await self.con.execute(r"""
+                CREATE TYPE ExtA2;
+                CREATE TYPE ExtC2 EXTENDING ExtA2, Object;
+                # This is busted because no ordering can be consistent
+                # with the base ordering here.
+                CREATE TYPE ExtD2 EXTENDING Object, ExtA2;
+            """)
 
     async def test_edgeql_ddl_extending_03(self):
         # Check that ancestors are recomputed properly on rebase.
@@ -8101,6 +8248,18 @@ type default::Foo {
             await self.con.execute("""
                 CREATE TYPE SomeObject6;
                 ALTER TYPE SomeObject6 EXTENDING FreeObject;
+            """)
+
+    async def test_edgeql_ddl_extending_07(self):
+        await self.con.execute(r"""
+            create type A;
+            create type B extending A;
+        """)
+        with self.assertRaisesRegex(
+                edgedb.SchemaError,
+                r"could not find consistent ancestor order"):
+            await self.con.execute(r"""
+                create type C extending A, B;
             """)
 
     async def test_edgeql_ddl_modules_01(self):
@@ -9990,6 +10149,8 @@ type default::Foo {
                 create required property status -> Status;
             }
         """)
+
+        # enum casts in constraints
         await self.con.execute("""
             alter type Order {
                 create constraint exclusive on ((Status.open = .status));
@@ -10002,12 +10163,24 @@ type default::Foo {
         """)
         await self.con.execute("""
             alter type Order {
+                create constraint exclusive on (('open' = <str>.status));
+            };
+        """)
+
+        # enum casts in indexes
+        await self.con.execute("""
+            alter type Order {
                 create index on ((Status.open = .status));
             };
         """)
         await self.con.execute("""
             alter type Order {
                 create index on ((<Status>'open' = .status));
+            };
+        """)
+        await self.con.execute("""
+            alter type Order {
+                create index on (('open' = <str>.status));
             };
         """)
 
@@ -12446,6 +12619,42 @@ CREATE MIGRATION m14i24uhm6przo3bpl2lqndphuomfrtq3qdjaqdg6fza7h6m7tlbra
             [{'generated_by': 'DDLStatement'}]
         )
 
+    async def test_edgeql_ddl_create_migration_04(self):
+        await self.con.execute('''
+            CREATE MIGRATION
+            {
+                create global foo -> str;
+                create type Foo;
+            };
+        ''')
+        await self.con.execute('''
+            insert Foo;
+        ''')
+
+        # Currently, SET GLOBAL is not allowed in migration scripts.
+        # Once we make it allowed, we will need to make it actually
+        # work, and there is a commented bit below to test that.
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                "Unexpected keyword 'global'"):
+            await self.con.execute('''
+                CREATE MIGRATION
+                {
+                    set global foo := "test";
+                    alter type Foo {
+                        create required property name -> str {
+                        set default := (global foo);
+                    }
+                };
+            ''')
+
+        # await self.assert_query_result(
+        #     '''
+        #     SELECT Foo.name
+        #     ''',
+        #     ['test'],
+        # )
+
     async def test_edgeql_ddl_naked_backlink_in_computable(self):
         await self.con.execute('''
             CREATE TYPE User {
@@ -13661,6 +13870,8 @@ CREATE MIGRATION m14i24uhm6przo3bpl2lqndphuomfrtq3qdjaqdg6fza7h6m7tlbra
             [{
                 'script': textwrap.dedent(
                     '''\
+                    SET generated_by := (schema::MigrationGeneratedBy.\
+DDLStatement);
                     CREATE TYPE Foo {
                         CREATE PROPERTY foo := (1);
                     };'''
@@ -13722,10 +13933,7 @@ CREATE MIGRATION m14i24uhm6przo3bpl2lqndphuomfrtq3qdjaqdg6fza7h6m7tlbra
             INSERT Foo { tgt := (INSERT Tgt) };
         """)
 
-        async with self.assertRaisesRegexTx(
-            edgedb.ConstraintViolationError,
-            'prohibited by link target policy',
-        ):
+        async with self._run_and_rollback():
             await self.con.execute("""
                 WITH D := Foo,
                 SELECT {(DELETE D.tgt), (DELETE D)};
@@ -14923,6 +15131,25 @@ CREATE MIGRATION m14i24uhm6przo3bpl2lqndphuomfrtq3qdjaqdg6fza7h6m7tlbra
             delete Foo;
         """)
 
+    async def test_edgeql_ddl_switch_link_computed_01(self):
+        await self.con.execute(r"""
+            create type Tgt;
+            create type Src {
+                create multi link l1 -> Tgt { create property s1 -> str; };
+                create multi link l2 -> Tgt { create property s2 -> str; };
+                create link c := (.l1);
+            };
+        """)
+        await self.con.execute(r"""
+            select Src { c: {@s1} };
+        """)
+        await self.con.execute(r"""
+            alter type Src alter link c using (.l2);
+        """)
+        await self.con.execute(r"""
+            select Src { c: {@s2} };
+        """)
+
     async def test_edgeql_ddl_set_abs_linkprop_type(self):
         await self.con.execute(r"""
             CREATE ABSTRACT LINK orderable {
@@ -15121,6 +15348,22 @@ CREATE MIGRATION m14i24uhm6przo3bpl2lqndphuomfrtq3qdjaqdg6fza7h6m7tlbra
             create type X { create link foo -> Tgt };
             create alias Y := X { foo: {id} };
             alter type X { create link bar := .foo };
+        """)
+
+    async def test_edgeql_ddl_computed_intersection_lprop_01(self):
+        await self.con.execute(r"""
+            create type Pointer;
+            create type Property extending Pointer;
+            create type Link extending Pointer;
+            create type ObjectType {
+                create multi link pointers -> Pointer {
+                    create property owned -> bool;
+                };
+                create link links := .pointers[is Link];
+            };
+        """)
+        await self.con.query(r"""
+            select ObjectType {links: {@owned}};
         """)
 
     async def test_edgeql_ddl_rebase_views_01(self):

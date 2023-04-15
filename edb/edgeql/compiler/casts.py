@@ -36,6 +36,7 @@ from edb.schema import constraints as s_constr
 from edb.schema import functions as s_func
 from edb.schema import indexes as s_indexes
 from edb.schema import name as sn
+from edb.schema import scalars as s_scalars
 from edb.schema import types as s_types
 from edb.schema import utils as s_utils
 from edb.schema import name as s_name
@@ -96,15 +97,14 @@ def compile_cast(
             f'`...[IS {new_stype.get_displayname(ctx.env.schema)}]` instead',
             context=srcctx)
 
-    uuid_t = ctx.env.get_track_schema_type(sn.QualName('std', 'uuid'))
+    uuid_t = ctx.env.get_schema_type_and_track(sn.QualName('std', 'uuid'))
     if (
         orig_stype.issubclass(ctx.env.schema, uuid_t)
         and new_stype.is_object_type()
     ):
         return _find_object_by_id(ir_expr, new_stype, ctx=ctx)
 
-    json_t = ctx.env.get_track_schema_type(
-        sn.QualName('std', 'json'))
+    json_t = ctx.env.get_schema_type_and_track(sn.QualName('std', 'json'))
 
     if isinstance(ir_set.expr, irast.Array):
         return _cast_array_literal(
@@ -134,9 +134,13 @@ def compile_cast(
             ir_set, orig_stype, new_stype,
             cardinality_mod=cardinality_mod, ctx=ctx)
 
-    if new_stype.issubclass(ctx.env.schema, orig_stype):
-        # The new type is a subtype, so may potentially have
-        # a more restrictive domain, generate a cast call.
+    if (
+        new_stype.issubclass(ctx.env.schema, orig_stype)
+        or _has_common_concrete_scalar(orig_stype, new_stype, ctx=ctx)
+    ):
+        # The new type is a subtype or a sibling type of a shared
+        # ancestor, so may potentially have a more restrictive domain,
+        # generate a cast call.
         return _inheritance_cast_to_ir(
             ir_set, orig_stype, new_stype,
             cardinality_mod=cardinality_mod, ctx=ctx)
@@ -159,7 +163,9 @@ def compile_cast(
             # Casts from json to enums need some special handling
             # here, where we have access to the enum type. Just turn
             # it into json->str and str->enum.
-            str_typ = ctx.env.get_track_schema_type(sn.QualName('std', 'str'))
+            str_typ = ctx.env.get_schema_type_and_track(
+                sn.QualName('std', 'str')
+            )
             str_ir = compile_cast(ir_expr, str_typ, srcctx=srcctx, ctx=ctx)
             return compile_cast(
                 str_ir,
@@ -219,12 +225,20 @@ def compile_cast(
     # Constraints and indexes require an immutable expression, but pg cast is
     # only stable. In this specific case, we use cast wrapper function that
     # is declared to be immutable.
-    if new_stype.is_enum(ctx.env.schema):
+    if orig_stype.is_enum(ctx.env.schema) or new_stype.is_enum(ctx.env.schema):
         objctx = ctx.env.options.schema_object_context
         if objctx in (s_constr.Constraint, s_indexes.Index):
-            return _cast_enum_immutable(
-                ir_expr, orig_stype, new_stype, ctx=ctx
+
+            str_typ = ctx.env.schema.get(
+                sn.QualName("std", "str"),
+                type=s_types.Type,
             )
+            orig_str = orig_stype.issubclass(ctx.env.schema, str_typ)
+            new_str = new_stype.issubclass(ctx.env.schema, str_typ)
+            if orig_str or new_str:
+                return _cast_enum_str_immutable(
+                    ir_expr, orig_stype, new_stype, ctx=ctx
+                )
 
     return _compile_cast(
         ir_expr,
@@ -233,6 +247,20 @@ def compile_cast(
         cardinality_mod=cardinality_mod,
         srcctx=srcctx,
         ctx=ctx,
+    )
+
+
+def _has_common_concrete_scalar(
+        orig_stype: s_types.Type,
+        new_stype: s_types.Type, *,
+        ctx: context.ContextLevel) -> bool:
+    schema = ctx.env.schema
+    return bool(
+        isinstance(orig_stype, s_scalars.ScalarType)
+        and isinstance(new_stype, s_scalars.ScalarType)
+        and (orig_base := orig_stype.maybe_get_topmost_concrete_base(schema))
+        and (new_base := new_stype.maybe_get_topmost_concrete_base(schema))
+        and orig_base == new_base
     )
 
 
@@ -424,7 +452,8 @@ def _find_cast(
     # Don't try to pick up casts when there is a direct subtyping
     # relationship.
     if (orig_stype.issubclass(ctx.env.schema, new_stype)
-            or new_stype.issubclass(ctx.env.schema, orig_stype)):
+            or new_stype.issubclass(ctx.env.schema, orig_stype)
+            or _has_common_concrete_scalar(orig_stype, new_stype, ctx=ctx)):
         return None
 
     casts = ctx.env.schema.get_casts_to_type(new_stype)
@@ -701,7 +730,7 @@ def _cast_json_to_range(
 
         range_el_t = new_stype.get_element_type(ctx.env.schema)
         ql_range_el_t = typegen.type_to_ql_typeref(range_el_t, ctx=subctx)
-        bool_t = ctx.env.get_track_schema_type(sn.QualName('std', 'bool'))
+        bool_t = ctx.env.get_schema_type_and_track(sn.QualName('std', 'bool'))
         ql_bool_t = typegen.type_to_ql_typeref(bool_t, ctx=subctx)
 
         cast = qlast.FunctionCall(
@@ -942,19 +971,33 @@ def _cast_array_literal(
     return setgen.ensure_set(cast_ir, ctx=ctx)
 
 
-def _cast_enum_immutable(
+def _cast_enum_str_immutable(
     ir_expr: Union[irast.Set, irast.Expr],
     orig_stype: s_types.Type,
     new_stype: s_types.Type,
     *,
     ctx: context.ContextLevel,
 ) -> irast.Set:
+    """
+    Compiles cast between an enum and std::str
+    under the assumption that this expression must be immutable.
+    """
+
+    if new_stype.is_enum(ctx.env.schema):
+        enum_stype = new_stype
+        suffix = "_from_str"
+    else:
+        enum_stype = orig_stype
+        suffix = "_into_str"
+
+    name: s_name.Name = enum_stype.get_name(ctx.env.schema)
+    name = cast(s_name.QualName, name)
+    cast_name = s_name.QualName(
+        module=name.module, name=str(enum_stype.id) + suffix
+    )
+
     orig_typeref = typegen.type_to_typeref(orig_stype, env=ctx.env)
     new_typeref = typegen.type_to_typeref(new_stype, env=ctx.env)
-
-    name: s_name.Name = new_stype.get_name(ctx.env.schema)
-    name = cast(s_name.QualName, name)
-    cast_name = s_name.QualName(module=name.module, name=str(new_stype.id))
 
     cast_ir = irast.TypeCast(
         expr=setgen.ensure_set(ir_expr, ctx=ctx),

@@ -30,6 +30,8 @@ from edb.common import uuidgen
 from edb.schema import name as sn
 from edb.schema import objtypes as s_objtypes
 from edb.schema import pointers as s_pointers
+from edb.schema import schema as s_schema
+from edb.schema import constraints as s_constraints
 
 from edb.pgsql import common
 from edb.pgsql import types
@@ -123,7 +125,8 @@ enum_re = re.compile(
     r'(?P<p>enum) (?P<v>edgedb([\w-]+)."(?P<id>[\w-]+)_domain")')
 
 
-def translate_pgtype(schema, msg):
+def translate_pgtype_inner(schema, msg):
+    """Try to replace any internal pg type name with an edgedb type name"""
     translated = pgtype_re.sub(
         lambda r: str(types.base_type_name_map_r.get(r.group(0), r.group(0))),
         msg,
@@ -143,6 +146,22 @@ def translate_pgtype(schema, msg):
     translated = enum_re.sub(replace, msg)
 
     return translated
+
+
+def translate_pgtype(schema, msg):
+    """Try to translate a message that might refer to internal pg types.
+
+    We *want* to replace internal pg type names with edgedb names, but only
+    when they actually refer to types.
+    The messages aren't really structured well enough to support this properly,
+    so we approximate it by only doing the replacement *before* the first colon
+    in the message, so if a user does `<int64>"bigint"`, and we get the message
+    'invalid input syntax for type bigint: "bigint"', we do the right thing.
+    """
+
+    leading, *rest = msg.split(':')
+    leading_translated = translate_pgtype_inner(schema, leading)
+    return ':'.join([leading_translated, *rest])
 
 
 def get_error_details(fields):
@@ -369,6 +388,9 @@ def _static_interpret_cardinality_violation(_code, err_details):
     elif err_details.constraint_name == 'std::assert_distinct':
         return errors.ConstraintViolationError(err_details.message)
 
+    elif err_details.constraint_name == 'std::assert':
+        return errors.QueryAssertionError(err_details.message)
+
     elif err_details.constraint_name == 'set abstract':
         return errors.ConstraintViolationError(err_details.message)
 
@@ -403,7 +425,12 @@ def interpret_by_code(code, schema, err_details, hint):
 
 
 @interpret_by_code.register_for_all(constraint_errors)
-def _interpret_constraint_errors(code, schema, err_details, hint):
+def _interpret_constraint_errors(
+    code: str,
+    schema: s_schema.Schema,
+    err_details: ErrorDetails,
+    hint: Optional[str],
+):
     details = None
     if code == pgerrors.ERROR_NOT_NULL_VIOLATION:
         colname = err_details.column_name
@@ -412,8 +439,17 @@ def _interpret_constraint_errors(code, schema, err_details, hint):
                 ptr_id, *_ = colname[2:].partition('_')
             else:
                 ptr_id = colname
-            pointer = common.get_object_from_backend_name(
-                schema, s_pointers.Pointer, ptr_id)
+            if ptr_id == 'id':
+                assert err_details.table_name
+                obj_type: s_objtypes.ObjectType = schema.get_by_id(
+                    uuidgen.UUID(err_details.table_name),
+                    type=s_objtypes.ObjectType,
+                )
+                pointer = obj_type.getptr(schema, sn.UnqualName('id'))
+            else:
+                pointer = common.get_object_from_backend_name(
+                    schema, s_pointers.Pointer, ptr_id
+                )
             pname = pointer.get_verbosename(schema, with_parent=True)
         else:
             pname = None
@@ -445,17 +481,24 @@ def _interpret_constraint_errors(code, schema, err_details, hint):
     # the static version
 
     if error_type == 'constraint' or error_type == 'idconstraint':
+        assert err_details.constraint_name
+
         # similarly, if we're here it's because we have a constraint_id
         if error_type == 'constraint':
-            constraint_id, _, _ = err_details.constraint_name.rpartition(';')
-            constraint_id = uuidgen.UUID(constraint_id)
-            constraint = schema.get_by_id(constraint_id)
+            constraint_id_s, _, _ = err_details.constraint_name.rpartition(';')
+            assert err_details.constraint_name
+            constraint_id = uuidgen.UUID(constraint_id_s)
+            constraint = schema.get_by_id(
+                constraint_id, type=s_constraints.Constraint
+            )
         else:
             # Primary key violations give us the table name, so
             # look through that for the constraint
             obj_id, _, _ = err_details.constraint_name.rpartition('_')
-            obj_ptr = schema.get_by_id(uuidgen.UUID(obj_id)).getptr(
-                schema, sn.UnqualName('id'))
+            obj_type = schema.get_by_id(
+                uuidgen.UUID(obj_id), type=s_objtypes.ObjectType
+            )
+            obj_ptr = obj_type.getptr(schema, sn.UnqualName('id'))
             constraint = obj_ptr.get_exclusive_constraints(schema)[0]
 
         msg = constraint.format_error(schema)
@@ -479,6 +522,7 @@ def _interpret_constraint_errors(code, schema, err_details, hint):
             f'Existing {source_name}.{pointer_name} '
             f'values violate the new constraint')
     elif error_type == 'scalar':
+        assert match
         domain_name = match.group(1)
         stype_name = types.base_type_name_map_r.get(domain_name)
         if stype_name:

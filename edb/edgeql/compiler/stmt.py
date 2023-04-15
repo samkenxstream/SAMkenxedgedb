@@ -135,8 +135,7 @@ def compile_SelectQuery(
 
         stmt.where = clauses.compile_where_clause(expr.where, ctx=sctx)
 
-        stmt.orderby = clauses.compile_orderby_clause(
-            expr.orderby, ctx=sctx)
+        stmt.orderby = clauses.compile_orderby_clause(expr.orderby, ctx=sctx)
 
         stmt.offset = clauses.compile_limit_offset_clause(
             expr.offset, ctx=sctx)
@@ -414,10 +413,13 @@ def compile_InsertQuery(
         expr: qlast.InsertQuery, *,
         ctx: context.ContextLevel) -> irast.Set:
 
-    if ctx.in_conditional is not None:
+    if ctx.disallow_dml:
         raise errors.QueryError(
-            'INSERT statements cannot be used inside conditional '
-            'expressions',
+            f'INSERT statements cannot be used {ctx.disallow_dml}',
+            hint=(
+                f'To resolve this try to factor out the mutation '
+                f'expression into the top-level WITH block.'
+            ),
             context=expr.context,
         )
 
@@ -485,8 +487,6 @@ def compile_InsertQuery(
         stmt.conflict_checks = conflicts.compile_inheritance_conflict_checks(
             stmt, stmt_subject_stype, ctx=ictx)
 
-        ctx.env.dml_stmts.add(stmt)
-
         if expr.unless_conflict is not None:
             constraint_spec, else_branch = expr.unless_conflict
 
@@ -513,7 +513,7 @@ def compile_InsertQuery(
             )
 
         if pol_condition := policies.compile_dml_write_policies(
-            mat_stype, result, mode=qltypes.AccessKind.Insert, ctx=ctx
+            mat_stype, result, mode=qltypes.AccessKind.Insert, ctx=ictx
         ):
             stmt.write_policies[mat_stype.id] = pol_condition
 
@@ -556,13 +556,17 @@ def _get_dunder_type_ptrref(ctx: context.ContextLevel) -> irast.PointerRef:
 def compile_UpdateQuery(
         expr: qlast.UpdateQuery, *, ctx: context.ContextLevel) -> irast.Set:
 
-    if ctx.in_conditional is not None:
+    if ctx.disallow_dml:
         raise errors.QueryError(
-            'UPDATE statements cannot be used inside conditional expressions',
+            f'UPDATE statements cannot be used {ctx.disallow_dml}',
+            hint=(
+                f'To resolve this try to factor out the mutation '
+                f'expression into the top-level WITH block.'
+            ),
             context=expr.context,
         )
 
-    # Record this node in the list of potential DML expressions.
+    # Record this node in the list of DML statements.
     ctx.env.dml_exprs.append(expr)
 
     with ctx.subquery() as ictx:
@@ -617,8 +621,6 @@ def compile_UpdateQuery(
                 exprtype=s_types.ExprType.Update,
                 ctx=bodyctx)
 
-        ctx.env.dml_stmts.add(stmt)
-
         result = setgen.class_set(
             mat_stype, path_id=stmt.subject.path_id, ctx=ctx,
         )
@@ -634,11 +636,11 @@ def compile_UpdateQuery(
 
         for dtype in schemactx.get_all_concrete(mat_stype, ctx=ctx):
             if read_pol := policies.compile_dml_read_policies(
-                dtype, result, mode=qltypes.AccessKind.UpdateRead, ctx=ctx
+                dtype, result, mode=qltypes.AccessKind.UpdateRead, ctx=ictx
             ):
                 stmt.read_policies[dtype.id] = read_pol
             if write_pol := policies.compile_dml_write_policies(
-                dtype, result, mode=qltypes.AccessKind.UpdateWrite, ctx=ctx
+                dtype, result, mode=qltypes.AccessKind.UpdateWrite, ctx=ictx
             ):
                 stmt.write_policies[dtype.id] = write_pol
 
@@ -654,9 +656,13 @@ def compile_UpdateQuery(
 def compile_DeleteQuery(
         expr: qlast.DeleteQuery, *, ctx: context.ContextLevel) -> irast.Set:
 
-    if ctx.in_conditional is not None:
+    if ctx.disallow_dml:
         raise errors.QueryError(
-            'DELETE statements cannot be used inside conditional expressions',
+            f'DELETE statements cannot be used {ctx.disallow_dml}',
+            hint=(
+                f'To resolve this try to factor out the mutation '
+                f'expression into the top-level WITH block.'
+            ),
             context=expr.context,
         )
 
@@ -753,10 +759,30 @@ def compile_DeleteQuery(
             )
 
         for dtype in schemactx.get_all_concrete(mat_stype, ctx=ctx):
+            # Compile policies for every concrete type
             if pol_cond := policies.compile_dml_read_policies(
-                dtype, result, mode=qltypes.AccessKind.Delete, ctx=ctx
+                dtype, result, mode=qltypes.AccessKind.Delete, ctx=ictx
             ):
                 stmt.read_policies[dtype.id] = pol_cond
+
+            schema = ctx.env.schema
+            # And find any pointers to delete
+            ptrs = []
+            for ptr in dtype.get_pointers(schema).objects(schema):
+                # If there is a pointer that has a real table and doesn't
+                # have a special ON SOURCE DELETE policy, arrange to
+                # delete it in the query itself.
+                if not ptr.is_pure_computable(schema) and (
+                    not ptr.singular(schema)
+                    or ptr.has_user_defined_properties(schema)
+                ) and (
+                    not isinstance(ptr, s_links.Link)
+                    or ptr.get_on_source_delete(schema) ==
+                    s_links.LinkSourceDeleteAction.Allow
+                ):
+                    ptrs.append(typegen.ptr_to_ptrref(ptr, ctx=ctx))
+
+            stmt.links_to_delete[dtype.id] = tuple(ptrs)
 
         result = fini_stmt(stmt, expr, ctx=ictx, parent_ctx=ctx)
 
@@ -786,7 +812,7 @@ def compile_DescribeStmt(
                     f'cannot describe full schema as {ql.language}')
 
             ct = typegen.type_to_typeref(
-                ctx.env.get_track_schema_type(
+                ctx.env.get_schema_type_and_track(
                     s_name.QualName('std', 'str')),
                 env=ctx.env,
             )
@@ -1009,7 +1035,7 @@ def compile_DescribeStmt(
                 text += masked
 
             ct = typegen.type_to_typeref(
-                ctx.env.get_track_schema_type(
+                ctx.env.get_schema_type_and_track(
                     s_name.QualName('std', 'str')),
                 env=ctx.env,
             )
@@ -1034,7 +1060,7 @@ def compile_Shape(
         ctx.env.compiled_stmts[subctx.qlstmt] = stmt
         subctx.class_view_overrides = subctx.class_view_overrides.copy()
 
-        with ctx.new() as exposed_ctx:
+        with subctx.new() as exposed_ctx:
             exposed_ctx.expr_exposed = context.Exposure.UNEXPOSED
             expr = dispatch.compile(shape_expr, ctx=exposed_ctx)
 
@@ -1139,6 +1165,10 @@ def fini_stmt(
     view: Optional[s_types.Type]
     path_id: Optional[irast.PathId]
 
+    if isinstance(irstmt, irast.MutatingStmt):
+        ctx.env.dml_stmts.append(irstmt)
+        irstmt.rewrites = ctx.env.dml_rewrites.pop(irstmt.subject, None)
+
     if (isinstance(t, s_pseudo.PseudoType)
             and t.is_any(ctx.env.schema)):
         # Need to produce something valid. Should get caught as an
@@ -1200,7 +1230,6 @@ def process_with_block(
                     with_entry.expr,
                     s_name.UnqualName(with_entry.alias),
                     binding_kind=irast.BindingKind.With,
-                    must_be_used=True,
                     ctx=scopectx,
                 )
                 results.append(binding)
@@ -1444,7 +1473,6 @@ def compile_query_subject(
             view_rptr=view_rptr,
             view_name=view_name,
             exprtype=exprtype,
-            parser_context=expr.context,
             ctx=ctx,
         )
 

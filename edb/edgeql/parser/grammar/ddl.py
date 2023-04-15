@@ -1282,25 +1282,29 @@ commands_block(
 
 class CreateIndexStmt(
     Nonterm,
-    commondl.ProcessFunctionParamsMixin,
     commondl.ProcessIndexMixin,
 ):
     def reduce_CreateIndex(self, *kids):
         r"""%reduce CREATE ABSTRACT INDEX NodeName \
-                    OptCreateIndexCommandsBlock"""
+                    OptExtendingSimple OptCreateIndexCommandsBlock"""
         self.val = qlast.CreateIndex(
             name=kids[3].val,
-            **self._process_sql_body(kids[4])
+            bases=kids[4].val,
+            **self._process_sql_body(kids[5])
         )
 
     def reduce_CreateIndex_CreateFunctionArgs(self, *kids):
         r"""%reduce CREATE ABSTRACT INDEX NodeName IndexExtArgList \
-                    OptCreateIndexCommandsBlock"""
-        self._validate_params(kids[4].val)
+                    OptExtendingSimple OptCreateIndexCommandsBlock"""
+        bases = kids[5].val
+        params, kwargs = self._process_params_or_kwargs(bases, kids[4].val)
+
         self.val = qlast.CreateIndex(
             name=kids[3].val,
-            params=kids[4].val,
-            **self._process_sql_body(kids[5])
+            params=params,
+            kwargs=kwargs,
+            bases=bases,
+            **self._process_sql_body(kids[6])
         )
 
 
@@ -1354,21 +1358,23 @@ class CreateConcreteIndexStmt(Nonterm, commondl.ProcessIndexMixin):
 
     def reduce_CreateConcreteIndex(self, *kids):
         r"""%reduce CREATE INDEX NodeName \
-                    OnExpr OptExceptExpr \
+                    OptIndexExtArgList OnExpr OptExceptExpr \
                     OptCreateCommandsBlock \
         """
+        kwargs = self._process_arguments(kids[3].val)
         self.val = qlast.CreateConcreteIndex(
             name=kids[2].val,
-            expr=kids[3].val,
-            except_expr=kids[4].val,
-            commands=kids[5].val,
+            kwargs=kwargs,
+            expr=kids[4].val,
+            except_expr=kids[5].val,
+            commands=kids[6].val,
         )
 
 
 #
 # ALTER CONCRETE INDEX
 #
-class AlterConcreteIndexStmt(Nonterm):
+class AlterConcreteIndexStmt(Nonterm, commondl.ProcessIndexMixin):
     def reduce_AlterConcreteIndex(self, *kids):
         r"""%reduce ALTER INDEX OnExpr OptExceptExpr \
                     AlterConcreteIndexCommandsBlock \
@@ -1378,6 +1384,20 @@ class AlterConcreteIndexStmt(Nonterm):
             expr=kids[2].val,
             except_expr=kids[3].val,
             commands=kids[4].val,
+        )
+
+    def reduce_AlterConcreteNamedIndex(self, *kids):
+        r"""%reduce ALTER INDEX NodeName OptIndexExtArgList OnExpr \
+                    OptExceptExpr \
+                    AlterConcreteIndexCommandsBlock \
+        """
+        kwargs = self._process_arguments(kids[3].val)
+        self.val = qlast.AlterConcreteIndex(
+            name=kids[2].val,
+            kwargs=kwargs,
+            expr=kids[4].val,
+            except_expr=kids[5].val,
+            commands=kids[6].val,
         )
 
 
@@ -1391,7 +1411,7 @@ commands_block(
 #
 # DROP CONCRETE INDEX
 #
-class DropConcreteIndexStmt(Nonterm):
+class DropConcreteIndexStmt(Nonterm, commondl.ProcessIndexMixin):
     def reduce_DropConcreteIndex(self, *kids):
         r"""%reduce DROP INDEX OnExpr OptExceptExpr \
                     OptDropConcreteIndexCommandsBlock \
@@ -1401,6 +1421,20 @@ class DropConcreteIndexStmt(Nonterm):
             expr=kids[2].val,
             except_expr=kids[3].val,
             commands=kids[4].val,
+        )
+
+    def reduce_DropConcreteNamedIndex(self, *kids):
+        r"""%reduce DROP INDEX NodeName OptIndexExtArgList OnExpr \
+                    OptExceptExpr \
+                    OptDropConcreteIndexCommandsBlock \
+        """
+        kwargs = self._process_arguments(kids[3].val)
+        self.val = qlast.DropConcreteIndex(
+            name=kids[2].val,
+            kwargs=kwargs,
+            expr=kids[4].val,
+            except_expr=kids[5].val,
+            commands=kids[6].val,
         )
 
 
@@ -1423,7 +1457,6 @@ class CreateRewriteStmt(Nonterm):
             OptCreateRewriteCommandsBlock
         """
         _, _, kinds, _, expr, commands = kids
-        print(expr.val)
         self.val = qlast.CreateRewrite(
             kinds=kinds.val,
             expr=expr.val,
@@ -1466,15 +1499,27 @@ class DropRewriteStmt(Nonterm):
 #
 # CREATE PROPERTY
 #
+
+commands_block(
+    'CreateProperty',
+    UsingStmt,
+    SetFieldStmt,
+    CreateAnnotationValueStmt,
+    AlterAnnotationValueStmt,
+    commondl.CreateSimpleExtending,
+)
+
+
 class CreatePropertyStmt(Nonterm):
     def reduce_CreateProperty(self, *kids):
         r"""%reduce CREATE ABSTRACT PROPERTY PtrNodeName OptExtendingSimple \
-                    OptCreateCommandsBlock \
+                    OptCreatePropertyCommandsBlock \
         """
+        vbases, vcommands = commondl.extract_bases(kids[4].val, kids[5].val)
         self.val = qlast.CreateProperty(
             name=kids[3].val,
-            bases=kids[4].val,
-            commands=kids[5].val,
+            bases=vbases,
+            commands=vcommands,
             abstract=True,
         )
 
@@ -1545,6 +1590,7 @@ commands_block(
     AlterAnnotationValueStmt,
     CreateConcreteConstraintStmt,
     CreateRewriteStmt,
+    commondl.CreateSimpleExtending,
 )
 
 
@@ -1555,13 +1601,30 @@ class CreateConcretePropertyStmt(Nonterm):
             OptExtendingSimple ARROW FullTypeExpr
             OptCreateConcretePropertyCommandsBlock
         """
+        vbases, vcommands = commondl.extract_bases(kids[4].val, kids[7].val)
         self.val = qlast.CreateConcreteProperty(
             name=kids[3].val,
-            bases=kids[4].val,
+            bases=vbases,
             is_required=kids[1].val.required,
             cardinality=kids[1].val.cardinality,
             target=kids[6].val,
-            commands=kids[7].val,
+            commands=vcommands,
+        )
+
+    def reduce_CreateRegularPropertyNew(self, *kids):
+        """%reduce
+            CREATE OptPtrQuals PROPERTY UnqualifiedPointerName
+            OptExtendingSimple COLON FullTypeExpr
+            OptCreateConcretePropertyCommandsBlock
+        """
+        vbases, vcommands = commondl.extract_bases(kids[4].val, kids[7].val)
+        self.val = qlast.CreateConcreteProperty(
+            name=kids[3].val,
+            bases=vbases,
+            is_required=kids[1].val.required,
+            cardinality=kids[1].val.cardinality,
+            target=kids[6].val,
+            commands=vcommands,
         )
 
     def reduce_CreateComputableProperty(self, *kids):
@@ -1590,6 +1653,10 @@ class CreateConcretePropertyStmt(Nonterm):
                         f'computed property with more than one expression',
                         context=kids[3].context)
                 target = cmd.value
+            elif isinstance(cmd, qlast.AlterAddInherit):
+                raise EdgeQLSyntaxError(
+                    f'computed property cannot specify EXTENDING',
+                    context=kids[3].context)
 
         if target is None:
             raise EdgeQLSyntaxError(
@@ -1756,6 +1823,7 @@ commands_block(
     CreateConcretePropertyStmt,
     CreateConcreteIndexStmt,
     CreateRewriteStmt,
+    commondl.CreateSimpleExtending,
 )
 
 
@@ -1765,10 +1833,14 @@ class CreateLinkStmt(Nonterm):
             CREATE ABSTRACT LINK PtrNodeName OptExtendingSimple \
             OptCreateLinkCommandsBlock \
         """
+        vbases, vcommands = commondl.extract_bases(
+            kids[4].val,
+            kids[5].val,
+        )
         self.val = qlast.CreateLink(
             name=kids[3].val,
-            bases=kids[4].val,
-            commands=kids[5].val,
+            bases=vbases,
+            commands=vcommands,
             abstract=True,
         )
 
@@ -1856,6 +1928,7 @@ commands_block(
     commondl.OnTargetDeleteStmt,
     commondl.OnSourceDeleteStmt,
     CreateRewriteStmt,
+    commondl.CreateSimpleExtending,
 )
 
 
@@ -1865,13 +1938,29 @@ class CreateConcreteLinkStmt(Nonterm):
             CREATE OptPtrQuals LINK UnqualifiedPointerName OptExtendingSimple
             ARROW FullTypeExpr OptCreateConcreteLinkCommandsBlock
         """
+        vbases, vcommands = commondl.extract_bases(kids[4].val, kids[7].val)
         self.val = qlast.CreateConcreteLink(
             name=kids[3].val,
-            bases=kids[4].val,
+            bases=vbases,
             is_required=kids[1].val.required,
             cardinality=kids[1].val.cardinality,
             target=kids[6].val,
-            commands=kids[7].val
+            commands=vcommands,
+        )
+
+    def reduce_CreateRegularLinkNew(self, *kids):
+        """%reduce
+            CREATE OptPtrQuals LINK UnqualifiedPointerName OptExtendingSimple
+            COLON FullTypeExpr OptCreateConcreteLinkCommandsBlock
+        """
+        vbases, vcommands = commondl.extract_bases(kids[4].val, kids[7].val)
+        self.val = qlast.CreateConcreteLink(
+            name=kids[3].val,
+            bases=vbases,
+            is_required=kids[1].val.required,
+            cardinality=kids[1].val.cardinality,
+            target=kids[6].val,
+            commands=vcommands
         )
 
     def reduce_CreateComputableLink(self, *kids):
@@ -1900,6 +1989,10 @@ class CreateConcreteLinkStmt(Nonterm):
                         f'computed link with more than one expression',
                         context=kids[3].context)
                 target = cmd.value
+            elif isinstance(cmd, qlast.AlterAddInherit):
+                raise EdgeQLSyntaxError(
+                    f'computed link cannot specify EXTENDING',
+                    context=kids[3].context)
 
         if target is None:
             raise EdgeQLSyntaxError(
@@ -2192,11 +2285,12 @@ class CreateObjectTypeStmt(Nonterm):
             CREATE ABSTRACT TYPE NodeName \
             OptExtendingSimple OptCreateObjectTypeCommandsBlock \
         """
+        _, _, _, name, bases, commands = kids
         self.val = qlast.CreateObjectType(
-            name=kids[3].val,
-            bases=kids[4].val,
+            name=name.val,
+            bases=bases.val,
             abstract=True,
-            commands=kids[5].val,
+            commands=commands.val,
         )
 
     def reduce_CreateRegularObjectTypeStmt(self, *kids):
@@ -2204,11 +2298,12 @@ class CreateObjectTypeStmt(Nonterm):
             CREATE TYPE NodeName \
             OptExtendingSimple OptCreateObjectTypeCommandsBlock \
         """
+        _, _, name, bases, commands = kids
         self.val = qlast.CreateObjectType(
-            name=kids[2].val,
-            bases=kids[3].val,
+            name=name.val,
+            bases=bases.val,
             abstract=False,
-            commands=kids[4].val,
+            commands=commands.val,
         )
 
 
@@ -2967,6 +3062,20 @@ class CreateGlobalStmt(Nonterm):
         """%reduce
             CREATE OptPtrQuals GLOBAL NodeName
             ARROW FullTypeExpr
+            OptCreateGlobalCommandsBlock
+        """
+        self.val = qlast.CreateGlobal(
+            name=kids[3].val,
+            is_required=kids[1].val.required,
+            cardinality=kids[1].val.cardinality,
+            target=kids[5].val,
+            commands=kids[6].val,
+        )
+
+    def reduce_CreateRegularGlobalNew(self, *kids):
+        """%reduce
+            CREATE OptPtrQuals GLOBAL NodeName
+            COLON FullTypeExpr
             OptCreateGlobalCommandsBlock
         """
         self.val = qlast.CreateGlobal(

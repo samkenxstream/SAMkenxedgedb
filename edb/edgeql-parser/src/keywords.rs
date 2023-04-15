@@ -117,7 +117,6 @@ pub const PARTIAL_RESERVED_KEYWORDS: &[&str] = &[
 
 pub const FUTURE_RESERVED_KEYWORDS: &[&str] = &[
     // Keep in sync with `tokenizer::is_keyword`
-    "analyze",
     "anyarray",
     "begin",
     "case",
@@ -125,7 +124,6 @@ pub const FUTURE_RESERVED_KEYWORDS: &[&str] = &[
     "deallocate",
     "discard",
     "end",
-    "execute",
     "explain",
     "fetch",
     "get",
@@ -165,7 +163,9 @@ pub const CURRENT_RESERVED_KEYWORDS: &[&str] = &[
     "__new__",
     "__old__",
     "__specified__",
+    "administer",
     "alter",
+    "analyze",
     "and",
     "anytuple",
     "anytype",

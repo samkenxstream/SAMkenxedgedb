@@ -35,6 +35,7 @@ from edb.schema import name as s_name
 from edb.schema import objects as s_obj
 from edb.schema import objtypes as s_objtypes
 from edb.schema import pointers as s_pointers
+from edb.schema import rewrites as s_rewrites
 from edb.schema import schema as s_schema
 from edb.schema import sources as s_sources
 from edb.schema import types as s_types
@@ -56,6 +57,7 @@ from . import pathctx
 from . import setgen
 from . import viewgen
 from . import schemactx
+from . import triggers
 from . import tuple_args
 from . import typegen
 
@@ -85,11 +87,24 @@ def init_context(
         # references as singletons for the purposes of the overall
         # expression cardinality inference, so we set up the scope
         # tree in the necessary fashion.
-        for singleton in options.singletons:
+        had_optional = False
+        for singleton_ent in options.singletons:
+            singleton, optional = (
+                singleton_ent if isinstance(singleton_ent, tuple)
+                else (singleton_ent, False)
+            )
+            had_optional |= optional
             path_id = compile_anchor('__', singleton, ctx=ctx).path_id
-            ctx.env.path_scope.attach_path(path_id, context=None)
-            ctx.env.singletons.append(path_id)
+            ctx.env.path_scope.attach_path(
+                path_id, optional=optional, context=None)
+            if not optional:
+                ctx.env.singletons.append(path_id)
             ctx.iterator_path_ids |= {path_id}
+
+        # If we installed any optional singletons, run the rest of the
+        # compilation under a fence to protect them.
+        if had_optional:
+            ctx.path_scope = ctx.path_scope.attach_fence()
 
     for orig, remapped in options.type_remaps.items():
         rset = compile_anchor('__', remapped, ctx=ctx)
@@ -114,6 +129,12 @@ def init_context(
     if options.detached:
         ctx.path_id_namespace = frozenset({ctx.aliases.get('ns')})
 
+    if options.schema_object_context is s_rewrites.Rewrite:
+        assert ctx.partial_path_prefix
+        typ = setgen.get_set_type(ctx.partial_path_prefix, ctx=ctx)
+        assert isinstance(typ, s_objtypes.ObjectType)
+        ctx.active_rewrites |= {typ, *typ.descendants(ctx.env.schema)}
+
     ctx.derived_target_module = options.derived_target_module
     ctx.toplevel_result_view_name = options.result_view_name
     ctx.implicit_id_in_shapes = options.implicit_id_in_shapes
@@ -131,6 +152,8 @@ def fini_expression(
     ctx: context.ContextLevel,
 ) -> irast.Command:
 
+    ctx.path_scope = ctx.env.path_scope
+
     ir = eta_expand.eta_expand_ir(ir, toplevel=True, ctx=ctx)
 
     if (
@@ -139,33 +162,14 @@ def fini_expression(
     ):
         ir = setgen.scoped_set(ir, ctx=ctx)
 
-    # exprs_to_clear collects sets where we should never need to use
-    # their expr in pgsql compilation, so we strip it out to make this
-    # more evident in debug output. We have to do the clearing at the
-    # end, because multiplicity/cardinality inference needs to be able
-    # to look through those pointers.
-    exprs_to_clear = _fixup_materialized_sets(ir, ctx=ctx)
-    exprs_to_clear.extend(_find_visible_binding_refs(ir, ctx=ctx))
+    # Compile any triggers that were triggered by the query
+    ir_triggers = triggers.compile_triggers(ctx=ctx)
 
-    # The inference context object will be shared between
-    # cardinality and multiplicity inferrers.
-    inf_ctx = inference.make_ctx(env=ctx.env)
-    cardinality = inference.infer_cardinality(
-        ir,
-        scope_tree=ctx.path_scope,
-        ctx=inf_ctx,
-    )
-
-    multiplicity = inference.infer_multiplicity(
-        ir, scope_tree=ctx.path_scope, ctx=inf_ctx
-    )
-
-    # Fix up weak namespaces
-    _rewrite_weak_namespaces(ir, ctx)
-
-    ctx.path_scope.validate_unique_ids()
-
-    # Infer cardinalities and multiplicities of various sets in side tables
+    # Collect all of the expressions stored in various side sets
+    # that can make it into the output, so that we can make sure
+    # to catch them all in our fixups and analyses.
+    # IMPORTANT: Any new expressions that are sent to the backend
+    # but don't appear in `ir` must be added here.
     extra_exprs = []
     extra_exprs += [
         rw for rw in ctx.env.type_rewrites.values()
@@ -175,13 +179,41 @@ def fini_expression(
         p.sub_params.decoder_ir for p in ctx.env.query_parameters.values()
         if p.sub_params and p.sub_params.decoder_ir
     ]
+    extra_exprs += [trigger.expr for stage in ir_triggers for trigger in stage]
+
+    all_exprs = [ir] + extra_exprs
+
+    # exprs_to_clear collects sets where we should never need to use
+    # their expr in pgsql compilation, so we strip it out to make this
+    # more evident in debug output. We have to do the clearing at the
+    # end, because multiplicity/cardinality inference needs to be able
+    # to look through those pointers.
+    exprs_to_clear = _fixup_materialized_sets(all_exprs, ctx=ctx)
+    for expr in all_exprs:
+        exprs_to_clear.extend(_find_visible_binding_refs(expr, ctx=ctx))
+
+    # The inference context object will be shared between
+    # cardinality and multiplicity inferrers.
+    inf_ctx = inference.make_ctx(env=ctx.env)
+    cardinality = inference.infer_cardinality(
+        ir, scope_tree=ctx.path_scope, ctx=inf_ctx
+    )
+    multiplicity = inference.infer_multiplicity(
+        ir, scope_tree=ctx.path_scope, ctx=inf_ctx
+    )
+
     for extra in extra_exprs:
         inference.infer_cardinality(
             extra, scope_tree=ctx.path_scope, ctx=inf_ctx)
         inference.infer_multiplicity(
             extra, scope_tree=ctx.path_scope, ctx=inf_ctx)
 
-    # ConfigSet and ConfigReset don't like being part of a Set
+    # Fix up weak namespaces
+    _rewrite_weak_namespaces(all_exprs, ctx)
+
+    ctx.path_scope.validate_unique_ids()
+
+    # ConfigSet and ConfigReset don't like being part of a Set, so bail early
     if isinstance(ir.expr, (irast.ConfigSet, irast.ConfigReset)):
         ir.expr.scope_tree = ctx.path_scope
         ir.expr.globals = list(ctx.env.query_globals.values())
@@ -189,59 +221,12 @@ def fini_expression(
         return ir.expr
 
     volatility = inference.infer_volatility(ir, env=ctx.env)
-
-    if ctx.env.options.schema_view_mode:
-        for view in ctx.view_nodes.values():
-            if view.is_collection():
-                continue
-
-            assert isinstance(view, s_types.InheritingType)
-            _elide_derived_ancestors(view, ctx=ctx)
-
-            if not isinstance(view, s_sources.Source):
-                continue
-
-            view_own_pointers = view.get_pointers(ctx.env.schema)
-            for vptr in view_own_pointers.objects(ctx.env.schema):
-                _elide_derived_ancestors(vptr, ctx=ctx)
-                ctx.env.schema = vptr.set_field_value(
-                    ctx.env.schema,
-                    'from_alias',
-                    True,
-                )
-
-                tgt = vptr.get_target(ctx.env.schema)
-                assert tgt is not None
-
-                if (tgt.is_union_type(ctx.env.schema)
-                        and tgt.get_is_opaque_union(ctx.env.schema)):
-                    # Opaque unions should manifest as std::BaseObject
-                    # in schema views.
-                    ctx.env.schema = vptr.set_target(
-                        ctx.env.schema,
-                        ctx.env.schema.get(
-                            'std::BaseObject', type=s_types.Type),
-                    )
-
-                if not isinstance(vptr, s_sources.Source):
-                    continue
-
-                vptr_own_pointers = vptr.get_pointers(ctx.env.schema)
-                for vlprop in vptr_own_pointers.objects(ctx.env.schema):
-                    _elide_derived_ancestors(vlprop, ctx=ctx)
-                    ctx.env.schema = vlprop.set_field_value(
-                        ctx.env.schema,
-                        'from_alias',
-                        True,
-                    )
-
     expr_type = inference.infer_type(ir, ctx.env)
 
     in_polymorphic_func = (
         ctx.env.options.func_params is not None and
         ctx.env.options.func_params.has_polymorphic(ctx.env.schema)
     )
-
     if (
         not in_polymorphic_func
         and not ctx.env.options.allow_generic_type_output
@@ -253,19 +238,18 @@ def fini_expression(
                 hint='Consider using an explicit type cast.',
                 context=ctx.env.type_origins.get(anytype))
 
-    must_use_views = [val for val in ctx.env.must_use_views.values() if val]
-    if must_use_views:
-        alias, srcctx = must_use_views[0]
-        raise errors.QueryError(
-            f'unused alias definition: {str(alias)!r}',
-            context=srcctx,
-        )
-
+    # Clear out exprs that we decided to omit from the IR
     for ir_set in exprs_to_clear:
         ir_set.expr = None
 
-    group.infer_group_aggregates(ir, ctx=ctx)
+    # Analyze GROUP statements to find aggregates that can be optimized
+    group.infer_group_aggregates(all_exprs, ctx=ctx)
 
+    # If we are producing a schema view, clean up the result types
+    if ctx.env.options.schema_view_mode:
+        _fixup_schema_view(ctx=ctx)
+
+    # Collect query parameters
     assert isinstance(ir, irast.Set)
     lparams = [
         p for p in ctx.env.query_parameters.values()
@@ -311,24 +295,20 @@ def fini_expression(
             if isinstance(s, irast.Set)},
         dml_exprs=ctx.env.dml_exprs,
         singletons=ctx.env.singletons,
+        triggers=ir_triggers,
     )
     return result
 
 
 def _fixup_materialized_sets(
-    ir: irast.Base, *, ctx: context.ContextLevel
+    irs: Sequence[irast.Base], *, ctx: context.ContextLevel
 ) -> List[irast.Set]:
     # Make sure that all materialized sets have their views compiled
     skips = {'materialized_sets'}
-    children = ast_visitor.find_children(ir, irast.Stmt, extra_skips=skips)
-    for nobe in ctx.env.source_map.values():
-        if nobe.irexpr:
-            children += ast_visitor.find_children(
-                nobe.irexpr, irast.Stmt, extra_skips=skips)
-    for node in ctx.env.type_rewrites.values():
-        if isinstance(node, irast.Set):
-            children += ast_visitor.find_children(
-                node, irast.Stmt, extra_skips=skips)
+    children = []
+    for ir in irs:
+        children += ast_visitor.find_children(
+            ir, irast.Stmt, extra_skips=skips)
 
     to_clear = []
     for stmt in ordered.OrderedSet(children):
@@ -438,7 +418,7 @@ def _try_namespace_fix(
 
 
 def _rewrite_weak_namespaces(
-    ir: irast.Base, ctx: context.ContextLevel
+    irs: Sequence[irast.Base], ctx: context.ContextLevel
 ) -> None:
     """Rewrite weak namespaces in path ids to be usable by the backend.
 
@@ -459,7 +439,7 @@ def _rewrite_weak_namespaces(
     for node in tree.strict_descendants:
         _try_namespace_fix(node, node)
 
-    scopes = irutils.find_path_scopes(ir)
+    scopes = irutils.find_path_scopes(irs)
 
     for ir_set in ctx.env.set_types:
         path_scope_id: Optional[int] = scopes.get(ir_set)
@@ -468,6 +448,74 @@ def _rewrite_weak_namespaces(
             # in temporary scopes, so we need to just skip those.
             if scope := ctx.env.scope_tree_nodes.get(path_scope_id):
                 _try_namespace_fix(scope, ir_set)
+
+
+def _fixup_schema_view(
+    *, ctx: context.ContextLevel
+) -> None:
+    """Finalize schema view types for inclusion in the real schema.
+
+    This includes setting from_alias flags and collapsing opaque
+    unions to BaseObject.
+    """
+    for view in ctx.view_nodes.values():
+        if view.is_collection():
+            continue
+
+        assert isinstance(view, s_types.InheritingType)
+        _elide_derived_ancestors(view, ctx=ctx)
+
+        if not isinstance(view, s_sources.Source):
+            continue
+
+        view_own_pointers = view.get_pointers(ctx.env.schema)
+        for vptr in view_own_pointers.objects(ctx.env.schema):
+            _elide_derived_ancestors(vptr, ctx=ctx)
+            ctx.env.schema = vptr.set_field_value(
+                ctx.env.schema,
+                'from_alias',
+                True,
+            )
+
+            tgt = vptr.get_target(ctx.env.schema)
+            assert tgt is not None
+
+            if (tgt.is_union_type(ctx.env.schema)
+                    and tgt.get_is_opaque_union(ctx.env.schema)):
+                # Opaque unions should manifest as std::BaseObject
+                # in schema views.
+                ctx.env.schema = vptr.set_target(
+                    ctx.env.schema,
+                    ctx.env.schema.get(
+                        'std::BaseObject', type=s_types.Type),
+                )
+
+            if not isinstance(vptr, s_sources.Source):
+                continue
+
+            vptr_own_pointers = vptr.get_pointers(ctx.env.schema)
+            for vlprop in vptr_own_pointers.objects(ctx.env.schema):
+                _elide_derived_ancestors(vlprop, ctx=ctx)
+                ctx.env.schema = vlprop.set_field_value(
+                    ctx.env.schema,
+                    'from_alias',
+                    True,
+                )
+
+
+def _get_nearest_non_source_derived_parent(
+    obj: s_obj.DerivableInheritingObjectT,
+    ctx: context.ContextLevel
+) -> s_obj.DerivableInheritingObjectT:
+    """Find the nearest ancestor of obj whose "root source" is not derived"""
+    schema = ctx.env.schema
+    while (
+        (src := s_pointers.get_root_source(obj, schema))
+        and isinstance(src, s_obj.DerivableInheritingObject)
+        and src.get_is_derived(schema)
+    ):
+        obj = obj.get_bases(schema).first(schema)
+    return obj
 
 
 def _elide_derived_ancestors(
@@ -482,12 +530,12 @@ def _elide_derived_ancestors(
     """
 
     pbase = obj.get_bases(ctx.env.schema).first(ctx.env.schema)
-    if pbase.get_is_derived(ctx.env.schema):
-        pbase = pbase.get_nearest_non_derived_parent(ctx.env.schema)
+    new_pbase = _get_nearest_non_source_derived_parent(pbase, ctx)
+    if pbase != new_pbase:
         ctx.env.schema = obj.set_field_value(
             ctx.env.schema,
             'bases',
-            s_obj.ObjectList.create(ctx.env.schema, [pbase]),
+            s_obj.ObjectList.create(ctx.env.schema, [new_pbase]),
         )
 
         ctx.env.schema = obj.set_field_value(
@@ -617,7 +665,6 @@ def declare_view(
     *,
     factoring_fence: bool=False,
     fully_detached: bool=False,
-    must_be_used: bool=False,
     binding_kind: irast.BindingKind,
     path_id_namespace: Optional[FrozenSet[str]]=None,
     ctx: context.ContextLevel,
@@ -688,9 +735,6 @@ def declare_view(
         view_type = setgen.get_set_type(view_set, ctx=ctx)
         ctx.aliased_views[alias] = view_type
         ctx.env.expr_view_cache[expr, alias] = view_set
-
-        if must_be_used and view_type not in ctx.env.must_use_views:
-            ctx.env.must_use_views[view_type] = (alias, expr.context)
 
     return view_set
 

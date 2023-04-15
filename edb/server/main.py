@@ -46,6 +46,7 @@ from edb import buildmeta
 from edb.common import exceptions
 from edb.common import devmode
 from edb.common import signalctl
+from edb.common import debug
 
 from . import args as srvargs
 from . import daemon
@@ -229,7 +230,12 @@ async def _run_server(
         ss.init_tls(
             args.tls_cert_file, args.tls_key_file, tls_cert_newly_generated)
 
-        ss.init_jwcrypto(args.jws_key_file, jws_keys_newly_generated)
+        ss.init_jwcrypto(
+            args.jws_key_file,
+            args.jwt_sub_allowlist_file,
+            args.jwt_revocation_list_file,
+            jws_keys_newly_generated,
+        )
 
         def load_configuration(_signum):
             logger.info("reloading configuration")
@@ -237,7 +243,11 @@ async def _run_server(
                 if args.readiness_state_file:
                     ss.reload_readiness_state(args.readiness_state_file)
                 ss.reload_tls(args.tls_cert_file, args.tls_key_file)
-                ss.load_jwcrypto(args.jws_key_file)
+                ss.load_jwcrypto(
+                    args.jws_key_file,
+                    args.jwt_sub_allowlist_file,
+                    args.jwt_revocation_list_file,
+                )
             except Exception:
                 logger.critical(
                     "Unexpected error occurred during reload configuration; "
@@ -429,24 +439,7 @@ async def run_server(
     global server
     server = server_mod
 
-    ver_meta = buildmeta.get_version_metadata()
-    extras = []
-    source = ""
-    if build_date := ver_meta["build_date"]:
-        nice_date = build_date.strftime("%Y-%m-%dT%H:%MZ")
-        source += f" on {nice_date}"
-    if ver_meta["scm_revision"]:
-        source += f" from revision {ver_meta['scm_revision']}"
-        if source_date := ver_meta["source_date"]:
-            nice_date = source_date.strftime("%Y-%m-%dT%H:%MZ")
-            source += f" ({nice_date})"
-    if source:
-        extras.append(f", built{source}")
-    if ver_meta["target"]:
-        extras.append(f"for {ver_meta['target']}")
-
-    ver_line = buildmeta.get_version_string() + " ".join(extras)
-    logger.info(f"starting EdgeDB server {ver_line}")
+    logger.info(f"starting EdgeDB server {buildmeta.get_version_line()}")
     logger.info(f'instance name: {args.instance_name!r}')
     if devmode.is_in_dev_mode():
         logger.info(f'development mode active')
@@ -462,6 +455,11 @@ async def run_server(
     logger.debug(
         f"defaulting to the '{args.default_auth_method}' authentication method"
     )
+
+    if debug.flags.pydebug_listen:
+        import debugpy
+
+        debugpy.listen(38782)
 
     _init_parsers()
 

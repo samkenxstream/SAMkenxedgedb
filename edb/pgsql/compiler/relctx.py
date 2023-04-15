@@ -23,8 +23,9 @@
 from __future__ import annotations
 from typing import *
 
-import collections
 import uuid
+
+import immutables as immu
 
 from edb import errors
 
@@ -110,11 +111,12 @@ def _pull_path_namespace(
                 continue
 
             rvar = pathctx.maybe_get_path_rvar(
-                target, path_id, aspect=aspect, flavor=flavor, env=ctx.env)
+                target, path_id, aspect=aspect, flavor=flavor
+            )
             if rvar is None or flavor == 'packed':
                 pathctx.put_path_rvar(
-                    target, path_id, source, aspect=aspect, flavor=flavor,
-                    env=ctx.env)
+                    target, path_id, source, aspect=aspect, flavor=flavor
+                )
 
 
 def pull_path_namespace(
@@ -165,15 +167,16 @@ def find_rvar(
                                aspect='value', flavor=flavor, ctx=ctx)
     if rvar is not None:
         pathctx.put_path_rvar_if_not_exists(
-            stmt, path_id, rvar, aspect='value', flavor=flavor, env=ctx.env)
+            stmt, path_id, rvar, aspect='value', flavor=flavor
+        )
 
         src_rvar = maybe_get_path_rvar(source_stmt, path_id=path_id,
                                        aspect='source', flavor=flavor, ctx=ctx)
 
         if src_rvar is not None:
             pathctx.put_path_rvar_if_not_exists(
-                stmt, path_id, src_rvar,
-                aspect='source', flavor=flavor, env=ctx.env)
+                stmt, path_id, src_rvar, aspect='source', flavor=flavor
+            )
 
     return rvar
 
@@ -213,7 +216,8 @@ def include_rvar(
         if path_id.is_objtype_path():
             if isinstance(rvar, pgast.RangeSubselect):
                 if pathctx.has_path_aspect(
-                        rvar.query, path_id, aspect='source', env=ctx.env):
+                    rvar.query, path_id, aspect='source'
+                ):
                     aspects += ('source',)
             else:
                 aspects += ('source',)
@@ -269,10 +273,12 @@ def include_specific_rvar(
     for aspect in aspects:
         if overwrite_path_rvar:
             pathctx.put_path_rvar(
-                stmt, path_id, rvar, flavor=flavor, aspect=aspect, env=ctx.env)
+                stmt, path_id, rvar, flavor=flavor, aspect=aspect
+            )
         else:
             pathctx.put_path_rvar_if_not_exists(
-                stmt, path_id, rvar, flavor=flavor, aspect=aspect, env=ctx.env)
+                stmt, path_id, rvar, flavor=flavor, aspect=aspect
+            )
 
     if update_mask:
         scopes = [ctx.scope_tree]
@@ -298,7 +304,7 @@ def has_rvar(
         return True
 
     while curstmt is not None:
-        if pathctx.has_rvar(curstmt, rvar, env=ctx.env):
+        if pathctx.has_rvar(curstmt, rvar):
             return True
         curstmt = ctx.rel_hierarchy.get(curstmt)
 
@@ -328,13 +334,14 @@ def _maybe_get_path_rvar(
     qry: Optional[pgast.Query] = stmt
     while qry is not None:
         rvar = pathctx.maybe_get_path_rvar(
-            qry, path_id, aspect=aspect, flavor=flavor, env=ctx.env)
+            qry, path_id, aspect=aspect, flavor=flavor
+        )
         if rvar is not None:
             if qry is not stmt:
                 # Cache the rvar reference.
-                pathctx.put_path_rvar(stmt, path_id, rvar,
-                                      flavor=flavor, aspect=aspect,
-                                      env=ctx.env)
+                pathctx.put_path_rvar(
+                    stmt, path_id, rvar, flavor=flavor, aspect=aspect
+                )
             return rvar, path_id
         qry = ctx.rel_hierarchy.get(qry)
 
@@ -406,7 +413,8 @@ def maybe_get_path_var(
 def new_empty_rvar(
         ir_set: irast.EmptySet, *,
         ctx: context.CompilerContextLevel) -> pgast.PathRangeVar:
-    nullrel = pgast.NullRelation(path_id=ir_set.path_id)
+    nullrel = pgast.NullRelation(
+        path_id=ir_set.path_id, type_or_ptr_ref=ir_set.typeref)
     rvar = rvar_for_rel(nullrel, ctx=ctx)
     pathctx.put_rvar_path_bond(rvar, ir_set.path_id)
     return rvar
@@ -440,8 +448,8 @@ def new_free_object_rvar(
             name=('edgedbext', 'uuid_generate_v4',), args=[]
         )
 
-        pathctx.put_path_identity_var(qry, path_id, id_expr, env=ctx.env)
-        pathctx.put_path_value_var(qry, path_id, id_expr, env=ctx.env)
+        pathctx.put_path_identity_var(qry, path_id, id_expr)
+        pathctx.put_path_value_var(qry, path_id, id_expr)
         apply_volatility_ref(qry, ctx=subctx)
 
     return rvar_for_rel(qry, typeref=typeref, lateral=lateral, ctx=ctx)
@@ -463,15 +471,14 @@ def deep_copy_primitive_rvar_path_var(
     if isinstance(rvar, pgast.RangeSubselect):
         for component in astutils.each_query_in_set(rvar.query):
             rref = pathctx.get_path_var(
-                component, orig_id, aspect='identity', env=env)
-            pathctx.put_path_var(
-                component, new_id, rref, aspect='identity',
-                env=env)
+                component, orig_id, aspect='identity', env=env
+            )
+            pathctx.put_path_var(component, new_id, rref, aspect='identity')
     else:
         rref = pathctx.get_path_output(
-            rvar.query, orig_id, aspect='identity', env=env)
-        pathctx.put_rvar_path_output(
-            rvar, new_id, aspect='identity', var=rref, env=env)
+            rvar.query, orig_id, aspect='identity', env=env
+        )
+        pathctx.put_rvar_path_output(rvar, new_id, aspect='identity', var=rref)
 
 
 def new_primitive_rvar(
@@ -594,7 +601,7 @@ def _new_inline_pointer_rvar(
         src_rvar, far_pid, env=ctx.env)
 
     pathctx.put_rvar_path_bond(ptr_rvar, far_pid)
-    pathctx.put_path_identity_var(ptr_rel, far_pid, var=far_ref, env=ctx.env)
+    pathctx.put_path_identity_var(ptr_rel, far_pid, var=far_ref)
 
     return ptr_rvar
 
@@ -631,17 +638,21 @@ def _new_mapped_pointer_rvar(
 
     ptr_rvar.query.path_id = ptr_pid
     pathctx.put_rvar_path_bond(ptr_rvar, src_pid)
-    pathctx.put_rvar_path_output(ptr_rvar, src_pid, aspect='identity',
-                                 var=near_ref, env=ctx.env)
-    pathctx.put_rvar_path_output(ptr_rvar, src_pid, aspect='value',
-                                 var=near_ref, env=ctx.env)
-    pathctx.put_rvar_path_output(ptr_rvar, tgt_pid, aspect='value',
-                                 var=far_ref, env=ctx.env)
+    pathctx.put_rvar_path_output(
+        ptr_rvar, src_pid, aspect='identity', var=near_ref
+    )
+    pathctx.put_rvar_path_output(
+        ptr_rvar, src_pid, aspect='value', var=near_ref
+    )
+    pathctx.put_rvar_path_output(
+        ptr_rvar, tgt_pid, aspect='value', var=far_ref
+    )
 
     if tgt_pid.is_objtype_path():
         pathctx.put_rvar_path_bond(ptr_rvar, tgt_pid)
-        pathctx.put_rvar_path_output(ptr_rvar, tgt_pid, aspect='identity',
-                                     var=far_ref, env=ctx.env)
+        pathctx.put_rvar_path_output(
+            ptr_rvar, tgt_pid, aspect='identity', var=far_ref
+        )
 
     return ptr_rvar
 
@@ -746,8 +757,7 @@ def ensure_transient_identity_for_path(
         args=[],
     )
 
-    pathctx.put_path_identity_var(
-        stmt, path_id, id_expr, force=True, env=ctx.env)
+    pathctx.put_path_identity_var(stmt, path_id, id_expr, force=True)
     pathctx.put_path_bond(stmt, path_id)
 
     if isinstance(stmt, pgast.SelectStmt):
@@ -823,7 +833,7 @@ def set_to_array(
     )
 
     result = pgast.SelectStmt()
-    aspects = pathctx.list_path_aspects(subrvar.query, path_id, env=ctx.env)
+    aspects = pathctx.list_path_aspects(subrvar.query, path_id)
     include_rvar(result, subrvar, path_id=path_id, aspects=aspects, ctx=ctx)
 
     val: Optional[pgast.BaseExpr] = (
@@ -832,12 +842,9 @@ def set_to_array(
     )
 
     if val is None:
-        value_var = pathctx.get_path_value_var(
-            result, path_id, env=ctx.env)
-        val = output.serialize_expr(
-            value_var, path_id=path_id, env=ctx.env)
-        pathctx.put_path_serialized_var(
-            result, path_id, val, force=True, env=ctx.env)
+        value_var = pathctx.get_path_value_var(result, path_id, env=ctx.env)
+        val = output.serialize_expr(value_var, path_id=path_id, env=ctx.env)
+        pathctx.put_path_serialized_var(result, path_id, val, force=True)
 
     if isinstance(val, pgast.TupleVarBase):
         val = output.serialize_expr(
@@ -1133,16 +1140,12 @@ def unpack_var(
         cur_ref = el.ref or pgast.ColumnRef(name=[el.colname])
 
         for aspect in ('value', 'serialized'):
-            pathctx.put_path_var(
-                qry, el_id, cur_ref, aspect=aspect, env=ctx.env,
-            )
+            pathctx.put_path_var(qry, el_id, cur_ref, aspect=aspect)
 
         if not el.packed:
-            pathctx.put_path_rvar(
-                stmt, el_id, rvar, aspect='value', env=ctx.env)
+            pathctx.put_path_rvar(stmt, el_id, rvar, aspect='value')
 
-            pathctx.put_path_rvar(
-                ctx.rel, el_id, rvar, aspect='value', env=ctx.env)
+            pathctx.put_path_rvar(ctx.rel, el_id, rvar, aspect='value')
         else:
             cref = pathctx.get_path_output(
                 qry, el_id, aspect='value', env=ctx.env)
@@ -1151,7 +1154,7 @@ def unpack_var(
             pathctx.put_path_packed_output(qry, el_id, val=cref)
 
             pathctx.put_path_rvar(
-                stmt, el_id, rvar, flavor='packed', aspect='value', env=ctx.env
+                stmt, el_id, rvar, flavor='packed', aspect='value'
             )
 
     # When we're producing an exposed shape, we need to rewrite the
@@ -1181,8 +1184,7 @@ def unpack_var(
                     continue
                 reqry = reserialize_object(el, tel, ctx=ctx)
                 pathctx.put_path_var(
-                    qry, tel.path_id, reqry, aspect='serialized',
-                    env=ctx.env, force=True
+                    qry, tel.path_id, reqry, aspect='serialized', force=True
                 )
 
         for aspect in rewrite_aspects:
@@ -1193,11 +1195,9 @@ def unpack_var(
                 output.serialize_expr(tv, path_id=path_id, env=ctx.env)
             )
             pathctx.put_path_var(
-                qry, view_path_id, sval, aspect=aspect, env=ctx.env, force=True
+                qry, view_path_id, sval, aspect=aspect, force=True
             )
-            pathctx.put_path_rvar(
-                ctx.rel, view_path_id, rvar, aspect=aspect, env=ctx.env
-            )
+            pathctx.put_path_rvar(ctx.rel, view_path_id, rvar, aspect=aspect)
 
     return rvar
 
@@ -1356,7 +1356,7 @@ def range_for_material_objtype(
     include_overlays: bool=True,
     include_descendants: bool=True,
     ignore_rewrites: bool=False,
-    dml_source: Optional[irast.MutatingStmt]=None,
+    dml_source: Optional[irast.MutatingLikeStmt]=None,
     ctx: context.CompilerContextLevel,
 ) -> pgast.PathRangeVar:
 
@@ -1369,24 +1369,43 @@ def range_for_material_objtype(
 
     assert isinstance(typeref.name_hint, sn.QualName)
 
-    key = (typeref.id, include_descendants)
+    dml_source_key = dml_source if ctx.trigger_mode else None
+    rw_key = (typeref.id, include_descendants)
+    key = rw_key + (dml_source_key,)
     if (
         not ignore_rewrites
-        and (rewrite := ctx.env.type_rewrites.get(key)) is not None
-        and key not in ctx.pending_type_ctes
+        and (rewrite := ctx.env.type_rewrites.get(rw_key)) is not None
+        and rw_key not in ctx.pending_type_ctes
         and not for_mutation
     ):
+        # Don't include overlays in the normal way in trigger mode
+        # when a type cte is used, because we bake the overlays into
+        # the cte instead (and so including them normally could union
+        # back in things that we have filtered out).
+        # We *don't* do this for __old__ and __new__; __old__ because
+        # we don't want overlays at all and __new__ because we want the
+        # overlays to apply after policies.
+        trigger_mode = (
+            ctx.trigger_mode
+            and not isinstance(dml_source, irast.TriggerAnchor)
+        )
+        if trigger_mode:
+            include_overlays = False
 
         type_rel: pgast.BaseRelation | pgast.CommonTableExpr
         if (type_cte := ctx.type_ctes.get(key)) is None:
             with ctx.newrel() as sctx:
-                sctx.pending_type_ctes.add(key)
+                sctx.pending_type_ctes.add(rw_key)
                 sctx.pending_query = sctx.rel
                 sctx.volatility_ref = ()
-                sctx.type_rel_overlays = collections.defaultdict(
-                    lambda: collections.defaultdict(list))
-                sctx.ptr_rel_overlays = collections.defaultdict(
-                    lambda: collections.defaultdict(list))
+                # Normally we want to compile type rewrites without
+                # polluting them with any sort of overlays, but when
+                # compiling triggers, we recompile all of the type
+                # rewrites *to include* overlays, so that we can't peek
+                # at all newly created objects that we can't see
+                if not trigger_mode:
+                    sctx.rel_overlays = context.RelOverlays()
+
                 dispatch.visit(rewrite, ctx=sctx)
                 # If we are expanding inhviews, we also expand type
                 # rewrites, so don't populate type_ctes. The normal
@@ -1434,7 +1453,11 @@ def range_for_material_objtype(
         and typeref.name_hint.module not in {'cfg', 'sys'}
     ):
         ops = []
-        for subref in [typeref, *irtyputils.get_typeref_descendants(typeref)]:
+        typerefs = [typeref, *irtyputils.get_typeref_descendants(typeref)]
+        all_abstract = all(subref.is_abstract for subref in typerefs)
+        for subref in typerefs:
+            if subref.is_abstract and not all_abstract:
+                continue
             rvar = range_for_material_objtype(
                 subref, path_id, lateral=lateral,
                 include_descendants=False,
@@ -1444,8 +1467,8 @@ def range_for_material_objtype(
             )
             qry = pgast.SelectStmt(from_clause=[rvar])
             sub_path_id = path_id
-            pathctx.put_path_value_rvar(qry, sub_path_id, rvar, env=env)
-            pathctx.put_path_source_rvar(qry, sub_path_id, rvar, env=env)
+            pathctx.put_path_value_rvar(qry, sub_path_id, rvar)
+            pathctx.put_path_source_rvar(qry, sub_path_id, rvar)
 
             ops.append(('union', qry))
 
@@ -1471,14 +1494,11 @@ def range_for_material_objtype(
             catenate=False,
         )
 
-        if typeref.name_hint.module in {'cfg', 'sys'} and include_descendants:
-            # Redirect all queries to schema tables to edgedbss
-            table_schema_name = 'edgedbss'
-
         relation = pgast.Relation(
             schemaname=table_schema_name,
             name=table_name,
             path_id=path_id,
+            type_or_ptr_ref=typeref,
         )
 
         rvar = pgast.RelRangeVar(
@@ -1501,9 +1521,9 @@ def range_for_material_objtype(
 
         qry = pgast.SelectStmt()
         qry.from_clause.append(rvar)
-        pathctx.put_path_value_rvar(qry, path_id, rvar, env=env)
+        pathctx.put_path_value_rvar(qry, path_id, rvar)
         if path_id.is_objtype_path():
-            pathctx.put_path_source_rvar(qry, path_id, rvar, env=env)
+            pathctx.put_path_source_rvar(qry, path_id, rvar)
         pathctx.put_path_bond(qry, path_id)
 
         set_ops.append(('union', qry))
@@ -1515,9 +1535,9 @@ def range_for_material_objtype(
                 from_clause=[rvar],
             )
 
-            pathctx.put_path_value_rvar(qry, cte_path_id, rvar, env=env)
+            pathctx.put_path_value_rvar(qry, cte_path_id, rvar)
             if path_id.is_objtype_path():
-                pathctx.put_path_source_rvar(qry, cte_path_id, rvar, env=env)
+                pathctx.put_path_source_rvar(qry, cte_path_id, rvar)
             pathctx.put_path_bond(qry, cte_path_id)
             pathctx.put_path_id_map(qry, path_id, cte_path_id)
 
@@ -1531,9 +1551,9 @@ def range_for_material_objtype(
             qry2 = pgast.SelectStmt(
                 from_clause=[qry_rvar]
             )
-            pathctx.put_path_value_rvar(qry2, path_id, qry_rvar, env=env)
+            pathctx.put_path_value_rvar(qry2, path_id, qry_rvar)
             if path_id.is_objtype_path():
-                pathctx.put_path_source_rvar(qry2, path_id, qry_rvar, env=env)
+                pathctx.put_path_source_rvar(qry2, path_id, qry_rvar)
             pathctx.put_path_bond(qry2, path_id)
 
             if op == 'replace':
@@ -1562,7 +1582,7 @@ def range_for_typeref(
     for_mutation: bool=False,
     include_descendants: bool=True,
     ignore_rewrites: bool=False,
-    dml_source: Optional[irast.MutatingStmt]=None,
+    dml_source: Optional[irast.MutatingLikeStmt]=None,
     ctx: context.CompilerContextLevel,
 ) -> pgast.PathRangeVar:
 
@@ -1595,9 +1615,9 @@ def range_for_typeref(
                 from_clause=[c_rvar],
             )
 
-            pathctx.put_path_value_rvar(qry, path_id, c_rvar, env=ctx.env)
+            pathctx.put_path_value_rvar(qry, path_id, c_rvar)
             if path_id.is_objtype_path():
-                pathctx.put_path_source_rvar(qry, path_id, c_rvar, env=ctx.env)
+                pathctx.put_path_source_rvar(qry, path_id, c_rvar)
 
             pathctx.put_path_bond(qry, path_id)
 
@@ -1629,9 +1649,7 @@ def range_for_typeref(
 
         int_rvar = pgast.IntersectionRangeVar(component_rvars=component_rvars)
         for aspect in ('source', 'value'):
-            pathctx.put_path_rvar(
-                wrapper, path_id, int_rvar, aspect=aspect, env=ctx.env
-            )
+            pathctx.put_path_rvar(wrapper, path_id, int_rvar, aspect=aspect)
 
         pathctx.put_path_bond(wrapper, path_id)
         rvar = rvar_for_rel(wrapper, lateral=lateral, typeref=typeref, ctx=ctx)
@@ -1643,6 +1661,7 @@ def range_for_typeref(
             lateral=lateral,
             include_descendants=include_descendants,
             ignore_rewrites=ignore_rewrites,
+            include_overlays=not for_mutation,
             for_mutation=for_mutation,
             dml_source=dml_source,
             ctx=ctx,
@@ -1764,16 +1783,15 @@ def table_from_ptrref(
         ptr_info.table_name, aspect
     )
 
-    if ptrref.name.module in {'cfg', 'sys'}:
-        # Redirect all queries to schema tables to edgedbss
-        table_schema_name = 'edgedbss'
-
+    typeref = ptrref.out_source if ptrref else None
     relation = pgast.Relation(
-        schemaname=table_schema_name, name=table_name)
+        schemaname=table_schema_name,
+        name=table_name,
+        type_or_ptr_ref=ptrref,
+    )
 
     # Pseudo pointers (tuple and type intersection) have no schema id.
     sobj_id = ptrref.id if isinstance(ptrref, irast.PointerRef) else None
-    typeref = ptrref.out_source if ptrref else None
     rvar = pgast.RelRangeVar(
         schema_object_id=sobj_id,
         typeref=typeref,
@@ -1788,7 +1806,7 @@ def table_from_ptrref(
 
 def range_for_ptrref(
     ptrref: irast.BasePointerRef, *,
-    dml_source: Optional[irast.MutatingStmt]=None,
+    dml_source: Optional[irast.MutatingLikeStmt]=None,
     for_mutation: bool=False,
     only_self: bool=False,
     path_id: Optional[irast.PathId]=None,
@@ -1844,6 +1862,13 @@ def range_for_ptrref(
         for ref in list(refs):
             lrefs.extend(ref.descendants())
             lrefs.append(ref)
+        concrete_lrefs = [
+            ref for ref in lrefs if not ref.out_source.is_abstract
+        ]
+        # If there aren't any concrete types, we still need to
+        # generate *something*, so just do all the abstract ones.
+        if concrete_lrefs:
+            lrefs = concrete_lrefs
     else:
         lrefs = list(refs)
 
@@ -1861,6 +1886,7 @@ def range_for_ptrref(
         )
         if not ptr_info:
             assert ptrref.union_components
+
             ptr_info = pg_types.get_ptrref_storage_info(
                 src_ptrref, resolve_type=False, link_bias=False,
             )
@@ -1877,6 +1903,7 @@ def range_for_ptrref(
             for_mutation=for_mutation,
             ctx=ctx,
         )
+        table.query.path_id = path_id
 
         qry = pgast.SelectStmt()
         qry.from_clause.append(table)
@@ -1894,10 +1921,8 @@ def range_for_ptrref(
         # the source rvar so that linkprops can be found here.
         if path_id:
             target_ref = qry.target_list[1].val
-            pathctx.put_path_identity_var(
-                qry, path_id, var=target_ref, env=ctx.env)
-            pathctx.put_path_source_rvar(
-                qry, path_id, table, env=ctx.env)
+            pathctx.put_path_identity_var(qry, path_id, var=target_ref)
+            pathctx.put_path_source_rvar(qry, path_id, table)
 
         # Only fire off the overlays at the end of each expanded inhview.
         # This only matters when we are doing expand_inhviews, and prevents
@@ -1925,9 +1950,9 @@ def range_for_ptrref(
                     target_ref = pgast.ColumnRef(
                         name=[rvar.alias.aliasname, cols[1]])
                     pathctx.put_path_identity_var(
-                        qry, cte_path_id, var=target_ref, env=ctx.env)
-                    pathctx.put_path_source_rvar(
-                        qry, cte_path_id, rvar, env=ctx.env)
+                        qry, cte_path_id, var=target_ref
+                    )
+                    pathctx.put_path_source_rvar(qry, cte_path_id, rvar)
                     pathctx.put_path_id_map(qry, path_id, cte_path_id)
 
                 set_ops.append((op, qry))
@@ -1949,7 +1974,7 @@ def range_for_ptrref(
 def range_for_pointer(
     pointer: irast.Pointer,
     *,
-    dml_source: Optional[irast.MutatingStmt] = None,
+    dml_source: Optional[irast.MutatingLikeStmt] = None,
     ctx: context.CompilerContextLevel,
 ) -> pgast.PathRangeVar:
 
@@ -2006,19 +2031,22 @@ def _add_type_rel_overlay(
         typeid: uuid.UUID,
         op: str,
         rel: Union[pgast.BaseRelation, pgast.CommonTableExpr], *,
-        dml_stmts: Iterable[irast.MutatingStmt] = (),
+        dml_stmts: Iterable[irast.MutatingLikeStmt] = (),
         path_id: irast.PathId,
         ctx: context.CompilerContextLevel) -> None:
     entry = (op, rel, path_id)
-    if dml_stmts:
-        for dml_stmt in dml_stmts:
-            overlays = ctx.type_rel_overlays[dml_stmt][typeid]
-            if entry not in overlays:
-                overlays.append(entry)
-    else:
-        overlays = ctx.type_rel_overlays[None][typeid]
+    dml_stmts2 = dml_stmts if dml_stmts else (None,)
+    # If there is a "global" overlay, and there is none for the
+    # current statements, use it as the base. This is important for
+    # not losing track of the global environment in triggers.
+    root = ctx.rel_overlays.type.get(None, immu.Map())
+    for dml_stmt in dml_stmts2:
+        ds_overlays = ctx.rel_overlays.type.get(dml_stmt, root)
+        overlays = ds_overlays.get(typeid, ())
         if entry not in overlays:
-            overlays.append(entry)
+            ds_overlays = ds_overlays.set(typeid, overlays + (entry,))
+            ctx.rel_overlays.type = (
+                ctx.rel_overlays.type.set(dml_stmt, ds_overlays))
 
 
 def add_type_rel_overlay(
@@ -2026,7 +2054,7 @@ def add_type_rel_overlay(
         op: str,
         rel: Union[pgast.BaseRelation, pgast.CommonTableExpr], *,
         stop_ref: Optional[irast.TypeRef]=None,
-        dml_stmts: Iterable[irast.MutatingStmt] = (),
+        dml_stmts: Iterable[irast.MutatingLikeStmt] = (),
         path_id: irast.PathId,
         ctx: context.CompilerContextLevel) -> None:
     typeref = typeref.real_material_type
@@ -2048,25 +2076,22 @@ def add_type_rel_overlay(
 def get_type_rel_overlays(
     typeref: irast.TypeRef,
     *,
-    dml_source: Optional[irast.MutatingStmt]=None,
+    dml_source: Optional[irast.MutatingLikeStmt]=None,
     ctx: context.CompilerContextLevel,
-) -> List[
-    Tuple[
-        str,
-        Union[pgast.BaseRelation, pgast.CommonTableExpr],
-        irast.PathId,
-    ]
-]:
+) -> tuple[context.OverlayEntry, ...]:
     if typeref.material_type is not None:
         typeref = typeref.material_type
 
-    return ctx.type_rel_overlays[dml_source][typeref.id]
+    if dml_source not in ctx.rel_overlays.type:
+        return ()
+    else:
+        return ctx.rel_overlays.type[dml_source].get(typeref.id, ())
 
 
 def reuse_type_rel_overlays(
     *,
-    dml_stmts: Iterable[irast.MutatingStmt] = (),
-    dml_source: irast.MutatingStmt,
+    dml_stmts: Iterable[irast.MutatingLikeStmt] = (),
+    dml_source: irast.MutatingLikeStmt,
     ctx: context.CompilerContextLevel,
 ) -> None:
     """Update type rel overlays when a DML statement is reused.
@@ -2075,13 +2100,13 @@ def reuse_type_rel_overlays(
     nested overlays) as an overlay for all the enclosing DML
     statements.
     """
-    ref_overlays = ctx.type_rel_overlays[dml_source]
+    ref_overlays = ctx.rel_overlays.type.get(dml_source, immu.Map())
     for tid, overlays in ref_overlays.items():
         for op, rel, path_id in overlays:
             _add_type_rel_overlay(
                 tid, op, rel, dml_stmts=dml_stmts, path_id=path_id, ctx=ctx
             )
-    ptr_overlays = ctx.ptr_rel_overlays[dml_source]
+    ptr_overlays = ctx.rel_overlays.ptr.get(dml_source, immu.Map())
     for (obj, ptr), poverlays in ptr_overlays.items():
         for op, rel, path_id in poverlays:
             _add_ptr_rel_overlay(
@@ -2095,27 +2120,31 @@ def _add_ptr_rel_overlay(
         ptrref_name: str,
         op: str,
         rel: Union[pgast.BaseRelation, pgast.CommonTableExpr], *,
-        dml_stmts: Iterable[irast.MutatingStmt] = (),
+        dml_stmts: Iterable[irast.MutatingLikeStmt] = (),
         path_id: irast.PathId,
         ctx: context.CompilerContextLevel) -> None:
 
     entry = (op, rel, path_id)
-    if dml_stmts:
-        for dml_stmt in dml_stmts:
-            overlays = ctx.ptr_rel_overlays[dml_stmt][typeid, ptrref_name]
-            if entry not in overlays:
-                overlays.append(entry)
-    else:
-        overlays = ctx.ptr_rel_overlays[None][typeid, ptrref_name]
+    dml_stmts2 = dml_stmts if dml_stmts else (None,)
+    key = typeid, ptrref_name
+    # If there is a "global" overlay, and there is none for the
+    # current statements, use it as the base. This is important for
+    # not losing track of the global environment in triggers.
+    root = ctx.rel_overlays.ptr.get(None, immu.Map())
+    for dml_stmt in dml_stmts2:
+        ds_overlays = ctx.rel_overlays.ptr.get(dml_stmt, root)
+        overlays = ds_overlays.get(key, ())
         if entry not in overlays:
-            overlays.append(entry)
+            ds_overlays = ds_overlays.set(key, overlays + (entry,))
+            ctx.rel_overlays.ptr = (
+                ctx.rel_overlays.ptr.set(dml_stmt, ds_overlays))
 
 
 def add_ptr_rel_overlay(
         ptrref: irast.PointerRef,
         op: str,
         rel: Union[pgast.BaseRelation, pgast.CommonTableExpr], *,
-        dml_stmts: Iterable[irast.MutatingStmt] = (),
+        dml_stmts: Iterable[irast.MutatingLikeStmt] = (),
         path_id: irast.PathId,
         ctx: context.CompilerContextLevel) -> None:
 
@@ -2133,25 +2162,12 @@ def add_ptr_rel_overlay(
 
 def get_ptr_rel_overlays(
     ptrref: irast.PointerRef, *,
-    dml_source: Optional[irast.MutatingStmt]=None,
+    dml_source: Optional[irast.MutatingLikeStmt]=None,
     ctx: context.CompilerContextLevel,
-) -> List[
-    Tuple[
-        str,
-        Union[pgast.BaseRelation, pgast.CommonTableExpr],
-        irast.PathId,
-    ]
-]:
+) -> tuple[context.OverlayEntry, ...]:
     typeref = ptrref.out_source.real_material_type
-    return ctx.ptr_rel_overlays[dml_source][typeref.id, ptrref.shortname.name]
-
-
-def clone_ptr_rel_overlays(
-    *,
-    ctx: context.CompilerContextLevel,
-) -> None:
-    ctx.ptr_rel_overlays = ctx.ptr_rel_overlays.copy()
-    for k, v in ctx.ptr_rel_overlays.items():
-        ctx.ptr_rel_overlays[k] = v.copy()
-        for k2, v2 in v.items():
-            v[k2] = list(v2)
+    if dml_source not in ctx.rel_overlays.ptr:
+        return ()
+    else:
+        key = typeref.id, ptrref.shortname.name
+        return ctx.rel_overlays.ptr[dml_source].get(key, ())

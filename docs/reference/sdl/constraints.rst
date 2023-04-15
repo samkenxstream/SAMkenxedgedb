@@ -33,10 +33,21 @@ Declare a *concrete* constraint on an integer type:
 Declare a *concrete* constraint on an object type:
 
 .. code-block:: sdl
+    :version-lt: 3.0
 
     type Vector {
         required property x -> float64;
         required property y -> float64;
+        constraint expression on (
+            __subject__.x^2 + __subject__.y^2 < 25
+        );
+    }
+
+.. code-block:: sdl
+
+    type Vector {
+        required x: float64;
+        required y: float64;
         constraint expression on (
             __subject__.x^2 + __subject__.y^2 < 25
         );
@@ -138,6 +149,10 @@ The valid SDL sub-declarations are listed below:
     - ``__subject__`` -- the value of the ``title`` annotation of the
       scalar type, property or link on which the constraint is
       defined.
+
+    If the content of curly braces does not match any variables,
+    the curly braces are emitted as-is. They can also be escaped by 
+    using double curly braces.
 
 :sdl:synopsis:`<annotation-declarations>`
     Set constraint :ref:`annotation <ref_eql_sdl_annotations>`

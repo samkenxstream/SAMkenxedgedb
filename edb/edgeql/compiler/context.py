@@ -186,16 +186,6 @@ class Environment:
 
     view_shapes_metadata: Dict[s_types.Type, irast.ViewShapeMetadata]
 
-    must_use_views: Dict[
-        s_types.Type,
-        Optional[Tuple[s_name.Name, Optional[parsing.ParserContext]]],
-    ]
-    """A set of views that *must* be used in an expression.
-
-    Once a view is used, we set it to None rather than removing it so
-    that we can avoid adding it again if it is defined inside a
-    computable."""
-
     schema_refs: Set[s_obj.Object]
     """A set of all schema objects referenced by an expression."""
 
@@ -216,10 +206,8 @@ class Environment:
     functions) that appear in a function body.
     """
 
-    dml_stmts: Set[irast.MutatingStmt]
-    """A list of DML expressions (statements and DML-containing
-    functions) that appear in a function body.
-    """
+    dml_stmts: list[irast.MutatingStmt]
+    """A list of DML statements in the query"""
 
     #: A list of bindings that should be assumed to be singletons.
     singletons: List[irast.PathId]
@@ -271,6 +259,9 @@ class Environment:
     path_scope_map: Dict[irast.Set, ScopeInfo]
     """A dictionary of scope info that are appropriate for a given view."""
 
+    dml_rewrites: Dict[irast.Set, irast.Rewrites]
+    """Compiled rewrites that should be attached to InsertStmt or UpdateStmt"""
+
     def __init__(
         self,
         *,
@@ -299,14 +290,13 @@ class Environment:
         self.view_shapes = collections.defaultdict(list)
         self.view_shapes_metadata = collections.defaultdict(
             irast.ViewShapeMetadata)
-        self.must_use_views = {}
         self.schema_refs = set()
         self.schema_ref_exprs = {} if options.track_schema_ref_exprs else None
         self.created_schema_objects = set()
         self.ptr_ref_cache = PointerRefCache()
         self.type_ref_cache = {}
         self.dml_exprs = []
-        self.dml_stmts = set()
+        self.dml_stmts = []
         self.pointer_derivation_map = collections.defaultdict(list)
         self.pointer_specified_info = {}
         self.singletons = []
@@ -320,6 +310,7 @@ class Environment:
         self.shape_type_cache = {}
         self.expr_view_cache = {}
         self.path_scope_map = {}
+        self.dml_rewrites = {}
 
     def add_schema_ref(
             self, sobj: s_obj.Object, expr: Optional[qlast.Base]) -> None:
@@ -328,7 +319,7 @@ class Environment:
             self.schema_ref_exprs.setdefault(sobj, set()).add(expr)
 
     @overload
-    def get_track_schema_object(  # NoQA: F811
+    def get_schema_object_and_track(  # NoQA: F811
         self,
         name: s_name.Name,
         expr: Optional[qlast.Base],
@@ -342,7 +333,7 @@ class Environment:
         ...
 
     @overload
-    def get_track_schema_object(  # NoQA: F811
+    def get_schema_object_and_track(  # NoQA: F811
         self,
         name: s_name.Name,
         expr: Optional[qlast.Base],
@@ -355,7 +346,7 @@ class Environment:
     ) -> Optional[s_obj.Object]:
         ...
 
-    def get_track_schema_object(  # NoQA: F811
+    def get_schema_object_and_track(  # NoQA: F811
         self,
         name: s_name.Name,
         expr: Optional[qlast.Base],
@@ -390,7 +381,7 @@ class Environment:
 
         return sobj
 
-    def get_track_schema_type(
+    def get_schema_type_and_track(
         self,
         name: s_name.Name,
         expr: Optional[qlast.Base]=None,
@@ -401,7 +392,7 @@ class Environment:
         condition: Optional[Callable[[s_obj.Object], bool]]=None,
     ) -> s_types.Type:
 
-        stype = self.get_track_schema_object(
+        stype = self.get_schema_object_and_track(
             name, expr, modaliases=modaliases, default=default, label=label,
             condition=condition, type=s_types.Type,
         )
@@ -544,11 +535,14 @@ class ContextLevel(compiler.ContextLevel):
     compiling_update_shape: bool
     """Whether an UPDATE shape is currently being compiled."""
 
-    in_conditional: Optional[parsing.ParserContext]
-    """Whether currently in a conditional branch."""
-
     active_computeds: ordered.OrderedSet[s_pointers.Pointer]
     """A ordered set of currently compiling computeds"""
+
+    disallow_dml: Optional[str]
+    """Whether we are currently in a place where no dml is allowed,
+        if not None, then it is of the form `in a FILTER clause`  """
+
+    active_rewrites: FrozenSet[s_objtypes.ObjectType]
 
     def __init__(
         self,
@@ -601,9 +595,11 @@ class ContextLevel(compiler.ContextLevel):
             self.empty_result_type_hint = None
             self.defining_view = None
             self.compiling_update_shape = False
-            self.in_conditional = None
             self.active_computeds = ordered.OrderedSet()
             self.recompiling_schema_alias = False
+            self.active_rewrites = frozenset()
+
+            self.disallow_dml = None
 
         else:
             self.env = prevlevel.env
@@ -640,9 +636,11 @@ class ContextLevel(compiler.ContextLevel):
             self.empty_result_type_hint = prevlevel.empty_result_type_hint
             self.defining_view = prevlevel.defining_view
             self.compiling_update_shape = prevlevel.compiling_update_shape
-            self.in_conditional = prevlevel.in_conditional
             self.active_computeds = prevlevel.active_computeds
             self.recompiling_schema_alias = prevlevel.recompiling_schema_alias
+            self.active_rewrites = prevlevel.active_rewrites
+
+            self.disallow_dml = prevlevel.disallow_dml
 
             if mode == ContextSwitchMode.SUBQUERY:
                 self.anchors = prevlevel.anchors.copy()
@@ -677,8 +675,6 @@ class ContextLevel(compiler.ContextLevel):
                 self.pending_stmt_own_path_id_namespace = frozenset()
                 self.pending_stmt_full_path_id_namespace = frozenset()
                 self.inserting_paths = {}
-
-                self.iterator_path_ids = frozenset()
 
                 self.view_rptr = None
                 self.view_scls = None

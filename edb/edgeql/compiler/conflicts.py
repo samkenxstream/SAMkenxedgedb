@@ -38,6 +38,7 @@ from edb.schema import utils as s_utils
 
 from edb.edgeql import ast as qlast
 from edb.edgeql import utils as qlutils
+from edb.edgeql import qltypes
 
 from . import astutils
 from . import context
@@ -79,7 +80,7 @@ def _get_needed_ptrs(
     return needed_ptrs, ptr_anchors
 
 
-def _compile_conflict_select(
+def _compile_conflict_select_for_obj_type(
     stmt: irast.MutatingStmt,
     subject_typ: s_objtypes.ObjectType,
     *,
@@ -101,6 +102,25 @@ def _compile_conflict_select(
     needed_ptrs, ptr_anchors = _get_needed_ptrs(
         subject_typ, obj_constrs, constrs.keys(), ctx=ctx
     )
+
+    # Check that no pointers in constraints are rewritten
+    for p in needed_ptrs:
+        ptr = subject_typ.getptr(ctx.env.schema, s_name.UnqualName(p))
+        rewrite_kind = (
+            qltypes.RewriteKind.Insert
+            if isinstance(stmt, irast.InsertStmt)
+            else qltypes.RewriteKind.Update
+            if isinstance(stmt, irast.UpdateStmt)
+            else None
+        )
+        if rewrite_kind:
+            rewrite = ptr.get_rewrite(ctx.env.schema, rewrite_kind)
+            if rewrite:
+                raise errors.UnsupportedFeatureError(
+                    "INSERT UNLESS CONFLICT cannot be used on properties or "
+                    "links that have a rewrite rule specified",
+                    context=parser_context,
+                )
 
     ctx.anchors = ctx.anchors.copy()
 
@@ -347,7 +367,7 @@ def _split_constraints(
     return type_maps
 
 
-def compile_conflict_select(
+def _compile_conflict_select(
     stmt: irast.MutatingStmt,
     subject_typ: s_objtypes.ObjectType,
     *,
@@ -379,7 +399,7 @@ def compile_conflict_select(
     from_parent = False
     frags = []
     for a_obj, (a_constrs, a_obj_constrs) in type_maps.items():
-        frag, frag_always_check = _compile_conflict_select(
+        frag, frag_always_check = _compile_conflict_select_for_obj_type(
             stmt, a_obj, obj_constrs=a_obj_constrs, constrs=a_constrs,
             for_inheritance=for_inheritance,
             fake_dml_set=fake_dml_set,
@@ -447,7 +467,7 @@ def compile_insert_unless_conflict(
         typ, include_id=has_id_write, ctx=ctx)
     obj_constrs = typ.get_constraints(ctx.env.schema).objects(ctx.env.schema)
 
-    select_ir, always_check, _ = compile_conflict_select(
+    select_ir, always_check, _ = _compile_conflict_select(
         stmt, typ,
         constrs=pointers,
         obj_constrs=obj_constrs,
@@ -531,7 +551,7 @@ def compile_insert_unless_conflict_on(
 
     ds = {ptr.get_shortname(schema).name: (ptr, field_constrs)
           for ptr in ptrs}
-    select_ir, always_check, from_anc = compile_conflict_select(
+    select_ir, always_check, from_anc = _compile_conflict_select(
         stmt, typ, constrs=ds, obj_constrs=list(obj_constrs),
         parser_context=stmt.context, ctx=ctx)
 
@@ -606,7 +626,7 @@ def _disallow_exclusive_linkprops(
                 )
 
 
-def compile_inheritance_conflict_selects(
+def _compile_inheritance_conflict_selects(
     stmt: irast.MutatingStmt,
     conflict: irast.MutatingStmt,
     typ: s_objtypes.ObjectType,
@@ -681,7 +701,7 @@ def compile_inheritance_conflict_selects(
 
     clauses = []
     for cnstr, (p, o) in entries:
-        select_ir, _, _ = compile_conflict_select(
+        select_ir, _, _ = _compile_conflict_select(
             stmt, typ,
             for_inheritance=True,
             fake_dml_set=fake_dml_set,
@@ -708,7 +728,15 @@ def compile_inheritance_conflict_checks(
 
     has_id_write = _has_explicit_id_write(stmt)
 
-    if not ctx.env.dml_stmts and not has_id_write:
+    relevant_dml = [
+        dml for dml in ctx.env.dml_stmts
+        if not isinstance(dml, irast.DeleteStmt)
+    ]
+    # Updates can conflict with themselves
+    if isinstance(stmt, irast.UpdateStmt):
+        relevant_dml.append(stmt)
+
+    if not relevant_dml and not has_id_write:
         return None
 
     assert isinstance(subject_stype, s_objtypes.ObjectType)
@@ -727,7 +755,7 @@ def compile_inheritance_conflict_checks(
     else:
         subject_stypes = [subject_stype]
 
-    for ir in ctx.env.dml_stmts:
+    for ir in relevant_dml:
         # N.B that for updates, the update itself will be in dml_stmts,
         # since an update can conflict with itself if there are subtypes.
         # If there aren't subtypes, though, skip it.
@@ -773,7 +801,10 @@ def compile_inheritance_conflict_checks(
 
     conflicters = []
     for subject_stype, anc_type, ir in modified_ancestors:
-        conflicters.extend(compile_inheritance_conflict_selects(
-            stmt, ir, anc_type, subject_stype, ctx=ctx))
+        conflicters.extend(
+            _compile_inheritance_conflict_selects(
+                stmt, ir, anc_type, subject_stype, ctx=ctx
+            )
+        )
 
     return conflicters or None

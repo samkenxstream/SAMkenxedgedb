@@ -152,7 +152,7 @@ class TestCaseMeta(type(unittest.TestCase)):
                 except (edgedb.TransactionSerializationError,
                         edgedb.TransactionDeadlockError):
                     if (
-                        try_no == 6
+                        try_no == 10
                         # Only do a retry loop when we have a transaction
                         or not getattr(self, 'TRANSACTION_ISOLATION', False)
                     ):
@@ -160,7 +160,8 @@ class TestCaseMeta(type(unittest.TestCase)):
                     else:
                         self.loop.run_until_complete(self.xact.rollback())
                         self.loop.run_until_complete(asyncio.sleep(
-                            (2 ** try_no) * 0.1 + random.randrange(100) * 0.001
+                            min((2 ** try_no) * 0.1, 10)
+                            + random.randrange(100) * 0.001
                         ))
                         self.xact = self.con.transaction()
                         self.loop.run_until_complete(self.xact.start())
@@ -212,7 +213,7 @@ class TestCase(unittest.TestCase, metaclass=TestCaseMeta):
         return True
 
     def add_fail_notes(self, **kwargs):
-        if not hasattr(self, 'fail_notes'):
+        if getattr(self, 'fail_notes', None) is None:
             self.fail_notes = {}
         self.fail_notes.update(kwargs)
 
@@ -316,6 +317,7 @@ class TestCase(unittest.TestCase, metaclass=TestCaseMeta):
             '_subtest': self._subtest,
             '_cleanups': [],
             '_type_equality_funcs': self._type_equality_funcs,
+            'fail_notes': getattr(self, 'fail_notes', None),
         }
 
 
@@ -657,17 +659,24 @@ class ClusterTestCase(BaseHTTPTestCase):
         return _fetch_metrics(host, port)
 
     @classmethod
-    def get_connect_args(cls, *,
-                         cluster=None,
-                         database=edgedb_defines.EDGEDB_SUPERUSER_DB,
-                         user=edgedb_defines.EDGEDB_SUPERUSER,
-                         password='test'):
+    def get_connect_args(
+        cls,
+        *,
+        cluster=None,
+        database=edgedb_defines.EDGEDB_SUPERUSER_DB,
+        user=edgedb_defines.EDGEDB_SUPERUSER,
+        password=None,
+        secret_key=None,
+    ):
+        if password is None and secret_key is None:
+            password = "test"
         if cluster is None:
             cluster = cls.cluster
         conargs = cluster.get_connect_args().copy()
         conargs.update(dict(user=user,
                             password=password,
-                            database=database))
+                            database=database,
+                            secret_key=secret_key))
         return conargs
 
     @classmethod
@@ -801,13 +810,22 @@ class RollbackChanges:
 class ConnectedTestCaseMixin:
 
     @classmethod
-    async def connect(cls, *,
-                      cluster=None,
-                      database=edgedb_defines.EDGEDB_SUPERUSER_DB,
-                      user=edgedb_defines.EDGEDB_SUPERUSER,
-                      password='test'):
+    async def connect(
+        cls,
+        *,
+        cluster=None,
+        database=edgedb_defines.EDGEDB_SUPERUSER_DB,
+        user=edgedb_defines.EDGEDB_SUPERUSER,
+        password=None,
+        secret_key=None,
+    ):
         conargs = cls.get_connect_args(
-            cluster=cluster, database=database, user=user, password=password)
+            cluster=cluster,
+            database=database,
+            user=user,
+            password=password,
+            secret_key=secret_key,
+        )
         return await tconn.async_connect_test_client(**conargs)
 
     def repl(self):
@@ -831,6 +849,8 @@ class ConnectedTestCaseMixin:
         env['EDGEDB_PORT'] = str(conargs['port'])
         if password := conargs.get('password'):
             env['EDGEDB_PASSWORD'] = password
+        if secret_key := conargs.get('secret_key'):
+            env['EDGEDB_SECRET_KEY'] = secret_key
 
         proc = subprocess.Popen(
             cmd, stdin=sys.stdin, stdout=sys.stdout, env=env)
@@ -1381,9 +1401,11 @@ class StableDumpTestCase(QueryTestCase, CLITestCaseMixin):
     async def check_dump_restore_single_db(self, check_method):
         with tempfile.NamedTemporaryFile() as f:
             dbname = edgedb_defines.EDGEDB_SUPERUSER_DB
-            self.run_cli('-d', dbname, 'dump', f.name)
+            await asyncio.to_thread(self.run_cli, '-d', dbname, 'dump', f.name)
             await self.tearDownSingleDB()
-            self.run_cli('-d', dbname, 'restore', f.name)
+            await asyncio.to_thread(
+                self.run_cli, '-d', dbname, 'restore', f.name
+            )
         await check_method(self)
 
     async def check_dump_restore(self, check_method):
@@ -1394,11 +1416,15 @@ class StableDumpTestCase(QueryTestCase, CLITestCaseMixin):
         tgt_dbname = f'{src_dbname}_restored'
         q_tgt_dbname = qlquote.quote_ident(tgt_dbname)
         with tempfile.NamedTemporaryFile() as f:
-            self.run_cli('-d', src_dbname, 'dump', f.name)
+            await asyncio.to_thread(
+                self.run_cli, '-d', src_dbname, 'dump', f.name
+            )
 
             await self.con.execute(f'CREATE DATABASE {q_tgt_dbname}')
             try:
-                self.run_cli('-d', tgt_dbname, 'restore', f.name)
+                await asyncio.to_thread(
+                    self.run_cli, '-d', tgt_dbname, 'restore', f.name
+                )
                 con2 = await self.connect(database=tgt_dbname)
             except Exception:
                 await drop_db(self.con, q_tgt_dbname)
@@ -1621,6 +1647,9 @@ class _EdgeDBServer:
         tls_key_file: Optional[os.PathLike] = None,
         tls_cert_mode: edgedb_args.ServerTlsCertMode = (
             edgedb_args.ServerTlsCertMode.SelfSigned),
+        jws_key_file: Optional[os.PathLike] = None,
+        jwt_sub_allowlist_file: Optional[os.PathLike] = None,
+        jwt_revocation_list_file: Optional[os.PathLike] = None,
         env: Optional[Dict[str, str]] = None,
     ) -> None:
         self.bind_addrs = bind_addrs
@@ -1648,6 +1677,9 @@ class _EdgeDBServer:
         self.tls_cert_file = tls_cert_file
         self.tls_key_file = tls_key_file
         self.tls_cert_mode = tls_cert_mode
+        self.jws_key_file = jws_key_file
+        self.jwt_sub_allowlist_file = jwt_sub_allowlist_file
+        self.jwt_revocation_list_file = jwt_revocation_list_file
         self.env = env
 
     async def wait_for_server_readiness(self, stream: asyncio.StreamReader):
@@ -1795,8 +1827,18 @@ class _EdgeDBServer:
         if self.tls_key_file:
             cmd += ['--tls-key-file', self.tls_key_file]
 
-        if self.readiness_state_file is not None:
+        if self.readiness_state_file:
             cmd += ['--readiness-state-file', self.readiness_state_file]
+
+        if self.jws_key_file:
+            cmd += ['--jws-key-file', self.jws_key_file]
+
+        if self.jwt_sub_allowlist_file:
+            cmd += ['--jwt-sub-allowlist-file', self.jwt_sub_allowlist_file]
+
+        if self.jwt_revocation_list_file:
+            cmd += ['--jwt-revocation-list-file',
+                    self.jwt_revocation_list_file]
 
         if self.debug:
             print(
@@ -1918,6 +1960,9 @@ def start_edgedb_server(
     tls_key_file: Optional[os.PathLike] = None,
     tls_cert_mode: edgedb_args.ServerTlsCertMode = (
         edgedb_args.ServerTlsCertMode.SelfSigned),
+    jws_key_file: Optional[os.PathLike] = None,
+    jwt_sub_allowlist_file: Optional[os.PathLike] = None,
+    jwt_revocation_list_file: Optional[os.PathLike] = None,
     env: Optional[Dict[str, str]] = None,
 ):
     if not devmode.is_in_dev_mode() and not runstate_dir:
@@ -1964,6 +2009,9 @@ def start_edgedb_server(
         tls_cert_file=tls_cert_file,
         tls_key_file=tls_key_file,
         tls_cert_mode=tls_cert_mode,
+        jws_key_file=jws_key_file,
+        jwt_sub_allowlist_file=jwt_sub_allowlist_file,
+        jwt_revocation_list_file=jwt_revocation_list_file,
         env=env,
     )
 

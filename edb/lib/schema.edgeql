@@ -130,9 +130,7 @@ CREATE ABSTRACT TYPE schema::CollectionType EXTENDING schema::PrimitiveType;
 
 
 CREATE TYPE schema::Array EXTENDING schema::CollectionType {
-    CREATE REQUIRED LINK element_type -> schema::Type {
-        ON TARGET DELETE DEFERRED RESTRICT;
-    };
+    CREATE REQUIRED LINK element_type -> schema::Type;
     CREATE PROPERTY dimensions -> array<std::int16>;
 };
 
@@ -141,9 +139,7 @@ CREATE TYPE schema::ArrayExprAlias EXTENDING schema::Array;
 
 
 CREATE TYPE schema::TupleElement EXTENDING std::BaseObject {
-    CREATE REQUIRED LINK type -> schema::Type {
-        ON TARGET DELETE DEFERRED RESTRICT;
-    };
+    CREATE REQUIRED LINK type -> schema::Type;
     CREATE PROPERTY name -> std::str;
 };
 
@@ -161,9 +157,7 @@ CREATE TYPE schema::TupleExprAlias EXTENDING schema::Tuple;
 
 
 CREATE TYPE schema::Range EXTENDING schema::CollectionType {
-    CREATE REQUIRED LINK element_type -> schema::Type {
-        ON TARGET DELETE DEFERRED RESTRICT;
-    };
+    CREATE REQUIRED LINK element_type -> schema::Type;
 };
 
 
@@ -201,9 +195,7 @@ EXTENDING schema::SubclassableObject {
 
 
 CREATE TYPE schema::Parameter EXTENDING schema::Object {
-    CREATE REQUIRED LINK type -> schema::Type {
-        ON TARGET DELETE DEFERRED RESTRICT;
-    };
+    CREATE REQUIRED LINK type -> schema::Type;
     CREATE REQUIRED PROPERTY typemod -> schema::TypeModifier;
     CREATE REQUIRED PROPERTY kind -> schema::ParameterKind;
     CREATE REQUIRED PROPERTY num -> std::int64;
@@ -218,9 +210,7 @@ CREATE ABSTRACT TYPE schema::CallableObject
         ON TARGET DELETE ALLOW;
     };
 
-    CREATE LINK return_type -> schema::Type {
-        ON TARGET DELETE DEFERRED RESTRICT;
-    };
+    CREATE LINK return_type -> schema::Type;
     CREATE PROPERTY return_typemod -> schema::TypeModifier;
 };
 
@@ -249,7 +239,8 @@ CREATE TYPE schema::Constraint
 };
 
 
-CREATE ABSTRACT TYPE schema::ConsistencySubject EXTENDING schema::Object {
+CREATE ABSTRACT TYPE schema::ConsistencySubject
+      EXTENDING schema::InheritingObject {
     CREATE MULTI LINK constraints EXTENDING schema::reference
     -> schema::Constraint {
         CREATE CONSTRAINT std::exclusive;
@@ -268,6 +259,10 @@ CREATE TYPE schema::Index
 {
     CREATE PROPERTY expr -> std::str;
     CREATE PROPERTY except_expr -> std::str;
+    CREATE MULTI LINK params EXTENDING schema::ordered -> schema::Parameter {
+        ON TARGET DELETE ALLOW;
+    };
+    CREATE PROPERTY kwargs -> array<tuple<name: str, expr: str>>;
 };
 
 
@@ -281,7 +276,7 @@ CREATE ABSTRACT TYPE schema::Source EXTENDING schema::Object {
 
 CREATE ABSTRACT TYPE schema::Pointer
     EXTENDING
-        schema::InheritingObject, schema::ConsistencySubject,
+        schema::ConsistencySubject,
         schema::AnnotationSubject
 {
     CREATE PROPERTY cardinality -> schema::Cardinality;
@@ -318,7 +313,10 @@ ALTER TYPE schema::Source {
 CREATE TYPE schema::Alias EXTENDING schema::AnnotationSubject
 {
     CREATE REQUIRED PROPERTY expr -> std::str;
-    CREATE REQUIRED LINK type -> schema::Type {
+    # This link is DEFINITELY not optional. This works around
+    # compiler weirdness that forces the DEFERRED RESTRICT
+    # behavior, which prohibits required-ness.
+    CREATE OPTIONAL LINK type -> schema::Type {
         ON TARGET DELETE DEFERRED RESTRICT;
     };
 };
@@ -326,8 +324,9 @@ CREATE TYPE schema::Alias EXTENDING schema::AnnotationSubject
 
 CREATE TYPE schema::ScalarType
     EXTENDING
-        schema::InheritingObject, schema::ConsistencySubject,
-        schema::AnnotationSubject, schema::PrimitiveType
+        schema::PrimitiveType,
+        schema::ConsistencySubject,
+        schema::AnnotationSubject
 {
     CREATE PROPERTY default -> std::str;
     CREATE PROPERTY enum_values -> array<std::str>;
@@ -400,11 +399,19 @@ CREATE FUNCTION std::sequence_next(
 
 CREATE TYPE schema::ObjectType
     EXTENDING
-        schema::InheritingObject, schema::ConsistencySubject,
-        schema::AnnotationSubject, schema::Type, schema::Source;
+        schema::Source,
+        schema::ConsistencySubject,
+        schema::InheritingObject,
+        schema::Type,
+        schema::AnnotationSubject;
 
 
 ALTER TYPE std::BaseObject {
+    # N.B: Since __type__ is uniquely determined by the type of the
+    # source object, as a special-case optimization we do not actually
+    # store it in the database. Instead, we inject it into the views
+    # we use to implement inheritance and inject it in the compiler
+    # when operating on tables directly.
     CREATE REQUIRED LINK __type__ -> schema::ObjectType {
         SET readonly := True;
     };
@@ -464,9 +471,7 @@ CREATE TYPE schema::Property EXTENDING schema::Pointer;
 
 ALTER TYPE schema::Pointer {
     CREATE LINK source -> schema::Source;
-    CREATE LINK target -> schema::Type {
-        ON TARGET DELETE DEFERRED RESTRICT;
-    };
+    CREATE LINK target -> schema::Type;
     CREATE MULTI LINK rewrites
             EXTENDING schema::reference -> schema::Rewrite {
         CREATE CONSTRAINT std::exclusive;
@@ -492,7 +497,9 @@ ALTER TYPE schema::ObjectType {
 
 
 CREATE TYPE schema::Global EXTENDING schema::AnnotationSubject {
-    CREATE REQUIRED LINK target -> schema::Type {
+    # This is most definitely NOT optional. It works around some
+    # compiler weirdness which requires the on target delete deferred restrict
+    CREATE OPTIONAL LINK target -> schema::Type {
         ON TARGET DELETE DEFERRED RESTRICT;
     };
     CREATE PROPERTY required -> std::bool;

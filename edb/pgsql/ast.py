@@ -127,12 +127,28 @@ class OutputVar(ImmutableBaseExpr):
     is_packed_multi: bool = False
 
 
+class ExprOutputVar(OutputVar):
+    """A "fake" output var representing a wrapped BaseExpr.
+
+    In some obscure cases (specifically, returning __type__ from a
+    non-view base relation that doesn't actually contain it), we need
+    to return a non output var value from something expecting
+    OutputVar.
+
+    Instead of fully blowing away the type discipline of OutputVar
+    and making everything operate on BaseExpr, we require such expressions
+    to be explicitly wrapped.
+    """
+
+    expr: BaseExpr
+
+
 class EdgeQLPathInfo(Base):
     """A general mixin providing EdgeQL-specific metadata on certain nodes."""
 
     # Ignore the below fields in AST visitor/transformer.
     __ast_meta__ = {
-        'path_scope', 'path_outputs', 'path_id', 'is_distinct',
+        'path_id', 'path_scope', 'path_outputs', 'is_distinct',
         'path_id_mask', 'path_namespace',
         'packed_path_outputs', 'packed_path_namespace',
     }
@@ -189,7 +205,8 @@ class BaseRangeVar(ImmutableBaseExpr):
     This can be though as a specific instance of a table within a query.
     """
 
-    __ast_meta__ = {'schema_object_id', 'tag'}
+    __ast_meta__ = {'schema_object_id', 'tag', 'ir_origins'}
+    __ast_mutable_fields__ = frozenset(['ir_origins'])
 
     # This is a hack, since there is some code that relies on not
     # having an alias on a range var (to refer to a CTE directly, for
@@ -203,6 +220,12 @@ class BaseRangeVar(ImmutableBaseExpr):
 
     #: Optional identification piece to describe what's inside the rvar
     tag: typing.Optional[str] = None
+
+    #: Optional reference to the sets that this refers to
+    #: Only used for helping recover information during explain.
+    #: The type is a list of objects to help prevent any thought
+    #: of using this field computationally during compilation.
+    ir_origins: typing.Optional[list[object]] = None
 
     def __repr__(self) -> str:
         return (
@@ -223,6 +246,11 @@ class BaseRelation(EdgeQLPathInfo, BaseExpr):
 
 class Relation(BaseRelation):
     """A reference to a table or a view."""
+
+    # The type or pointer this represents.
+    # Should be non-None for any relation arising from a type or
+    # pointer during compilation.
+    type_or_ptr_ref: typing.Optional[irast.TypeRef | irast.PointerRef] = None
 
     catalogname: typing.Optional[str] = None
     schemaname: typing.Optional[str] = None
@@ -288,10 +316,13 @@ class IntersectionRangeVar(PathRangeVar):
 
 
 class DynamicRangeVarFunc(typing.Protocol):
-    """A 'dynamic' range var that provides a callback hook.
+    """A 'dynamic' range var that provides a callback hook
+    for finding path_ids in range var.
 
     Used to sneak more complex search logic in.
     I am 100% going to regret this.
+
+    Update: Sully says that he hasn't regretted it yet.
     """
 
     # Lookup function for a DynamicRangeVar. If it returns a
@@ -475,6 +506,8 @@ class ReturningQuery(BaseRelation):
 
 class NullRelation(ReturningQuery):
     """Special relation that produces nulls for all its attributes."""
+
+    type_or_ptr_ref: typing.Optional[irast.TypeRef | irast.PointerRef] = None
 
     where_clause: typing.Optional[BaseExpr] = None
 
@@ -1002,6 +1035,10 @@ class IteratorCTE(ImmutableBase):
     cte: CommonTableExpr
     parent: typing.Optional[IteratorCTE]
 
+    # A list of other paths to *also* register the iterator rvar as
+    # providing when it is merged into a statement.
+    other_paths: tuple[tuple[irast.PathId, str], ...] = ()
+
 
 class Statement(Base):
     """A statement that does not return a relation"""
@@ -1122,7 +1159,7 @@ class SQLValueFunctionOP(enum.IntEnum):
 
 class SQLValueFunction(BaseExpr):
     op: SQLValueFunctionOP
-    arg: typing.Optional[BaseExpr]
+    arg: typing.Optional[BaseExpr] = None
 
 
 class CreateStmt(Statement):
@@ -1152,3 +1189,38 @@ class LockStmt(Statement):
     relations: typing.List[BaseRangeVar]
     mode: str
     no_wait: bool = False
+
+
+class CopyFormat(enum.IntEnum):
+    TEXT = enum.auto()
+    CSV = enum.auto()
+    BINARY = enum.auto()
+
+
+class CopyOptions(Base):
+    # Options for the copy command
+    format: typing.Optional[CopyFormat] = None
+    freeze: typing.Optional[bool] = None
+    delimiter: typing.Optional[str] = None
+    null: typing.Optional[str] = None
+    header: typing.Optional[bool] = None
+    quote: typing.Optional[str] = None
+    escape: typing.Optional[str] = None
+    force_quote: typing.List[str] = []
+    force_not_null: typing.List[str] = []
+    force_null: typing.List[str] = []
+    encoding: typing.Optional[str] = None
+
+
+class CopyStmt(Statement):
+    relation: typing.Optional[Relation]
+    colnames: typing.Optional[typing.List[str]]
+    query: typing.Optional[Query]
+
+    is_from: bool = False
+    is_program: bool = False
+    filename: typing.Optional[str]
+
+    options: CopyOptions
+
+    where_clause: typing.Optional[BaseExpr] = None

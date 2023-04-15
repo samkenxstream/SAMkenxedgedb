@@ -219,7 +219,8 @@ def get_scalar_backend_name(id, module_name, catenate=True, *, aspect=None):
         "domain",
         "sequence",
         "enum",
-        "enum-cast",
+        "enum-cast-into-str",
+        "enum-cast-from-str",
         "source-del-imm-otl-f",
         "source-del-imm-otl-t",
     ):
@@ -227,7 +228,9 @@ def get_scalar_backend_name(id, module_name, catenate=True, *, aspect=None):
             f'unexpected aspect for scalar backend name: {aspect!r}')
     name = s_name.QualName(module=module_name, name=str(id))
 
-    if aspect == "enum-cast":
+    if aspect.startswith("enum-cast-"):
+        suffix = "_into_str" if aspect == "enum-cast-into-str" else "_from_str"
+        name = s_name.QualName(name.module, name.name + suffix)
         return get_cast_backend_name(name, catenate, aspect="function")
 
     return convert_name(name, aspect, catenate)
@@ -242,6 +245,10 @@ def get_aspect_suffix(aspect):
         return aspect
 
 
+def is_inhview_name(name: str) -> bool:
+    return name.endswith('_t')
+
+
 def get_objtype_backend_name(
     id: uuid.UUID,
     module_name: str,
@@ -251,7 +258,7 @@ def get_objtype_backend_name(
 ):
     if aspect is None:
         aspect = 'table'
-    if aspect not in {'table', 'inhview'} and not re.match(
+    if aspect not in {'table', 'inhview', 'dummy'} and not re.match(
             r'(source|target)-del-(def|imm)-(inl|otl)-(f|t)', aspect):
         raise ValueError(
             f'unexpected aspect for object type backend name: {aspect!r}')
@@ -266,7 +273,7 @@ def get_pointer_backend_name(id, module_name, *, catenate=False, aspect=None):
     if aspect is None:
         aspect = 'table'
 
-    if aspect not in ('table', 'index', 'inhview'):
+    if aspect not in ('table', 'index', 'inhview', 'dummy'):
         raise ValueError(
             f'unexpected aspect for pointer backend name: {aspect!r}')
 

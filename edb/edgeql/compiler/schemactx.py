@@ -80,7 +80,7 @@ def get_schema_object(
         return view
 
     try:
-        stype = ctx.env.get_track_schema_object(
+        stype = ctx.env.get_schema_object_and_track(
             name=name,
             expr=ref,
             modaliases=ctx.modaliases,
@@ -134,7 +134,6 @@ def _get_type_variant(
 ) -> Optional[s_obj.Object]:
     type_variant = ctx.aliased_views.get(name)
     if type_variant is not None:
-        ctx.env.must_use_views[type_variant] = None
         return type_variant
     else:
         return None
@@ -326,9 +325,15 @@ def derive_ptr(
     if ptr.get_name(ctx.env.schema) == derived_name:
         qualifiers = qualifiers + (ctx.aliases.get('d'),)
 
+    # If we are deriving a backlink, we just register that instead of
+    # actually deriving from it.
     if derive_backlink:
         attrs = attrs.copy() if attrs else {}
         attrs['computed_backlink'] = ptr
+        ntarget = ptr.get_source(ctx.env.schema)
+        assert isinstance(ntarget, s_types.Type)
+        target = ntarget
+        ptr = ctx.env.schema.get('std::link', type=s_pointers.Pointer)
 
     ctx.env.schema, derived = ptr.derive_ref(
         ctx.env.schema,
@@ -341,14 +346,6 @@ def derive_ptr(
         mark_derived=True,
         transient=True,
         attrs=attrs)
-
-    # Delete the bogus parents from a derived computed backlink.
-    if derive_backlink:
-        link = [ctx.env.schema.get('std::link')]
-        ctx.env.schema = derived.set_field_value(
-            ctx.env.schema, 'bases', link)
-        ctx.env.schema = derived.set_field_value(
-            ctx.env.schema, 'ancestors', link)
 
     if not ptr.generic(ctx.env.schema):
         if isinstance(derived, s_sources.Source):
@@ -472,7 +469,7 @@ def concretify(
     t = get_material_type(t, ctx=ctx)
     if els := t.get_union_of(ctx.env.schema):
         ts = [concretify(e, ctx=ctx) for e in els.objects(ctx.env.schema)]
-        return get_union_type(ts , ctx=ctx)
+        return get_union_type(ts, ctx=ctx)
     if els := t.get_intersection_of(ctx.env.schema):
         ts = [concretify(e, ctx=ctx) for e in els.objects(ctx.env.schema)]
         return get_intersection_type(ts , ctx=ctx)

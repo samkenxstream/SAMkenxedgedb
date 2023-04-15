@@ -3374,6 +3374,17 @@ class TestUpdate(tb.QueryTestCase):
             }]
         )
 
+    async def test_edgeql_update_assert_calls_01(self):
+        await self.assert_query_result(
+            r"""
+            select assert_exists(assert_single((
+              select (update UpdateTest filter .name = 'update-test1'
+                      set {comment := "test"}) { comment }
+            )));
+            """,
+            [{"comment": "test"}]
+        )
+
     async def test_edgeql_update_covariant_01(self):
         await self.con.execute("""
             INSERT UpdateTestSubSubType {
@@ -3728,3 +3739,35 @@ class TestUpdate(tb.QueryTestCase):
             """,
             [{"name": "!"}]
         )
+
+    async def test_edgeql_update_where_order_dml(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                "INSERT statements cannot be used in a FILTER clause"):
+            await self.con.query('''
+                    update UpdateTest
+                    filter (INSERT UpdateTest {
+                                name := 't1',
+                            })
+                    set { name := '!' }
+            ''')
+
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                "UPDATE statements cannot be used in a FILTER clause"):
+            await self.con.query('''
+                    update UpdateTest
+                    filter (UPDATE UpdateTest set {
+                            name := 't1',
+                        })
+                    set { name := '!' }
+            ''')
+
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                "DELETE statements cannot be used in a FILTER clause"):
+            await self.con.query('''
+                    update UpdateTest
+                    filter (DELETE UpdateTest filter .name = 't1')
+                    set { name := '!' }
+            ''')

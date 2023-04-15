@@ -98,10 +98,15 @@ class InheritingObjectCommand(sd.ObjectCommand[so.InheritingObjectT]):
         inherited_fields_update = {}
         deferred_complex_ops = []
 
-        for field_name in field_names:
+        # Iterate over mcls.get_schema_fields() instead of field_names for
+        # determinism reasons, and so earlier declared fields get
+        # processed first.
+        for field_name, field in mcls.get_schema_fields().items():
+            if field_name not in field_names:
+                continue
+
             was_inherited = field_name in inherited_fields
             ignore_local_field = ignore_local or was_inherited
-            field = mcls.get_field(field_name)
 
             try:
                 result = field.merge_fn(
@@ -429,14 +434,14 @@ class InheritingObjectCommand(sd.ObjectCommand[so.InheritingObjectT]):
 
         return schema, deleted_refs
 
-    def _rebase_ref(
+    def _rebase_ref_cmd(
         self,
         schema: s_schema.Schema,
         context: sd.CommandContext,
         scls: s_referencing.ReferencedInheritingObject,
         old_bases: Sequence[so.InheritingObject],
         new_bases: Sequence[so.InheritingObject],
-    ) -> Tuple[s_schema.Schema, sd.Command]:
+    ) -> tuple[sd.Command, Optional[sd.Command]]:
         from . import referencing as s_referencing
 
         old_base_names = [b.get_name(schema) for b in old_bases]
@@ -489,6 +494,19 @@ class InheritingObjectCommand(sd.ObjectCommand[so.InheritingObjectT]):
             'ancestors',
             ancestors_coll,
         )
+
+        return alter_cmd_root, rebase_cmd
+
+    def _rebase_ref(
+        self,
+        schema: s_schema.Schema,
+        context: sd.CommandContext,
+        scls: s_referencing.ReferencedInheritingObject,
+        old_bases: Sequence[so.InheritingObject],
+        new_bases: Sequence[so.InheritingObject],
+    ) -> Tuple[s_schema.Schema, sd.Command]:
+        alter_cmd_root, _ = self._rebase_ref_cmd(
+            schema, context, scls, old_bases, new_bases)
 
         schema = alter_cmd_root.apply(schema, context)
 

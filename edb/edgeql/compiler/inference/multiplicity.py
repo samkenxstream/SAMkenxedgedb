@@ -709,6 +709,16 @@ def _infer_mutating_stmt(
     for read_pol in ir.read_policies.values():
         infer_multiplicity(read_pol.expr, scope_tree=scope_tree, ctx=ctx)
 
+    if ir.rewrites:
+        for rewrites in ir.rewrites.by_type.values():
+            for rewrite, _ in rewrites.values():
+                infer_multiplicity(
+                    rewrite,
+                    is_mutation=True,
+                    scope_tree=scope_tree,
+                    ctx=ctx,
+                )
+
 
 def _infer_on_conflict_clause(
     ir: irast.OnConflictClause,
@@ -844,6 +854,16 @@ def __infer_tuple(
         own=_max_multiplicity(els).own,
         elements=tuple(new_els),
     )
+
+
+@_infer_multiplicity.register
+def __infer_trigger_anchor(
+    ir: irast.TriggerAnchor,
+    *,
+    scope_tree: irast.ScopeTreeNode,
+    ctx: inf_ctx.InfCtx,
+) -> inf_ctx.MultiplicityInfo:
+    return UNIQUE
 
 
 def infer_multiplicity(

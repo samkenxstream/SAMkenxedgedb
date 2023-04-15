@@ -75,9 +75,13 @@ class ObjectTypeRefMixin(so.Object):
 
 
 class ObjectType(
-    s_types.InheritingType,
     sources.Source,
     constraints.ConsistencySubject,
+    s_types.InheritingType,
+
+    so.InheritingObject,  # Help reflection figure out the right db MRO
+    s_types.Type,  # Help reflection figure out the right db MRO
+    s_anno.AnnotationSubject,  # Help reflection figure out the right db MRO
     ObjectTypeRefMixin,
     s_abc.ObjectType,
     qlkind=qltypes.SchemaObjectClass.TYPE,
@@ -124,10 +128,7 @@ class ObjectType(
             return self.issubclass(schema, FreeObject)
 
     def is_fake_object_type(self, schema: s_schema.Schema) -> bool:
-        return (
-            self.get_name(schema).module == 'cfg'
-            or self.is_free_object_type(schema)
-        )
+        return self.is_free_object_type(schema)
 
     def is_material_object_type(self, schema: s_schema.Schema) -> bool:
         return not (
@@ -191,7 +192,11 @@ class ObjectType(
             if (
                 lnk.get_shortname(schema).name == name
                 and not lnk.get_source_type(schema).is_view(schema)
-                and lnk.get_owned(schema)
+                # Only grab the "base" pointers
+                and all(
+                    b.generic(schema)
+                    for b in lnk.get_bases(schema).objects(schema)
+                )
                 and (not sources or lnk.get_source_type(schema) in sources)
             )
         }
@@ -203,7 +208,11 @@ class ObjectType(
                 if (
                     lnk.get_shortname(schema).name == name
                     and not lnk.get_source_type(schema).is_view(schema)
-                    and lnk.get_owned(schema)
+                    # Only grab the "base" pointers
+                    and all(
+                        b.generic(schema)
+                        for b in lnk.get_bases(schema).objects(schema)
+                    )
                     and (not sources or lnk.get_source_type(schema) in sources)
                 )
             )
@@ -218,6 +227,14 @@ class ObjectType(
             ptrs.update(union.getrptrs(schema, name, sources=sources))
 
         return ptrs
+
+    def get_relevant_triggers(
+        self, kind: qltypes.TriggerKind, schema: s_schema.Schema
+    ) -> list[triggers.Trigger]:
+        return [
+            t for t in self.get_triggers(schema).objects(schema)
+            if kind in t.get_kinds(schema)
+        ]
 
     def implicitly_castable_to(
         self,

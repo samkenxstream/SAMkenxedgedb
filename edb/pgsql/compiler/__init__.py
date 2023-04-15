@@ -30,6 +30,7 @@ from edb.ir import ast as irast
 
 from edb.pgsql import ast as pgast
 from edb.pgsql import codegen as pgcodegen
+from edb.pgsql import debug as pgdebug
 from edb.pgsql import params as pgparams
 
 from . import config as _config_compiler  # NOQA
@@ -39,6 +40,7 @@ from . import stmt as _stmt_compiler  # NOQA
 from . import clauses
 from . import context
 from . import dispatch
+from . import dml
 
 from .context import OutputFormat as OutputFormat # NOQA
 
@@ -57,7 +59,10 @@ def compile_ir_to_sql_tree(
         Mapping[Tuple[irast.PathId, str], pgast.PathRangeVar]
     ] = None,
     external_rels: Optional[
-        Mapping[irast.PathId, pgast.BaseRelation]
+        Mapping[
+            irast.PathId,
+            Tuple[pgast.BaseRelation | pgast.CommonTableExpr, Tuple[str, ...]],
+        ]
     ] = None,
     backend_runtime_params: Optional[pgparams.BackendRuntimeParams]=None,
 ) -> Tuple[pgast.Base, context.Environment]:
@@ -66,6 +71,7 @@ def compile_ir_to_sql_tree(
         query_params = []
         query_globals = []
         type_rewrites = {}
+        triggers: tuple[tuple[irast.Trigger, ...], ...] = ()
 
         singletons = []
         if isinstance(ir_expr, irast.Statement):
@@ -74,6 +80,7 @@ def compile_ir_to_sql_tree(
             query_globals = list(ir_expr.globals)
             type_rewrites = ir_expr.type_rewrites
             singletons = ir_expr.singletons
+            triggers = ir_expr.triggers
             ir_expr = ir_expr.expr
         elif isinstance(ir_expr, irast.ConfigCommand):
             assert ir_expr.scope_tree
@@ -103,7 +110,6 @@ def compile_ir_to_sql_tree(
             singleton_mode=singleton_mode,
             scope_tree_nodes=scope_tree_nodes,
             external_rvars=external_rvars,
-            external_rels=external_rels,
             backend_runtime_params=backend_runtime_params,
         )
 
@@ -121,9 +127,13 @@ def compile_ir_to_sql_tree(
         ctx.expr_exposed = True
         for sing in singletons:
             ctx.path_scope[sing] = ctx.rel
+        if external_rels:
+            ctx.external_rels = external_rels
         clauses.populate_argmap(query_params, query_globals, ctx=ctx)
 
         qtree = dispatch.compile(ir_expr, ctx=ctx)
+        dml.compile_triggers(triggers, qtree, ctx=ctx)
+
         if isinstance(ir_expr, irast.Set) and not singleton_mode:
             assert isinstance(qtree, pgast.Query)
             clauses.fini_toplevel(qtree, ctx)
@@ -143,7 +153,7 @@ def compile_ir_to_sql_tree(
     return (qtree, env)
 
 
-def compile_ir_to_sql(
+def compile_ir_to_tree_and_sql(
     ir_expr: irast.Base, *,
     output_format: Optional[OutputFormat]=None,
     ignore_shapes: bool=False,
@@ -154,7 +164,7 @@ def compile_ir_to_sql(
     expand_inhviews: bool = False,
     pretty: bool=True,
     backend_runtime_params: Optional[pgparams.BackendRuntimeParams]=None,
-) -> Tuple[str, Dict[str, pgast.Param]]:
+) -> Tuple[pgast.Base, str, Dict[str, pgast.Param]]:
 
     qtree, _ = compile_ir_to_sql_tree(
         ir_expr,
@@ -193,8 +203,38 @@ def compile_ir_to_sql(
     ):
         debug.header('Reordered SQL')
         debug_sql_text = run_codegen(qtree, pretty=True, reordered=True)
+        if isinstance(ir_expr, irast.Statement):
+            # Rewrite uuids back into something approximating
+            # readable object names.
+            debug_sql_text = pgdebug.rewrite_names_in_sql(
+                debug_sql_text, ir_expr.schema)
         debug.dump_code(debug_sql_text, lexer='sql')
 
+    return qtree, sql_text, argmap
+
+
+def compile_ir_to_sql(
+    ir_expr: irast.Base, *,
+    output_format: Optional[OutputFormat]=None,
+    ignore_shapes: bool=False,
+    explicit_top_cast: Optional[irast.TypeRef]=None,
+    singleton_mode: bool=False,
+    use_named_params: bool=False,
+    expected_cardinality_one: bool=False,
+    pretty: bool=True,
+    backend_runtime_params: Optional[pgparams.BackendRuntimeParams]=None,
+) -> Tuple[str, Dict[str, pgast.Param]]:
+    _, sql_text, argmap = compile_ir_to_tree_and_sql(
+        ir_expr,
+        output_format=output_format,
+        ignore_shapes=ignore_shapes,
+        explicit_top_cast=explicit_top_cast,
+        singleton_mode=singleton_mode,
+        use_named_params=use_named_params,
+        expected_cardinality_one=expected_cardinality_one,
+        backend_runtime_params=backend_runtime_params,
+        pretty=pretty,
+    )
     return sql_text, argmap
 
 

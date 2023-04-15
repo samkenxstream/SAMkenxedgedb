@@ -120,7 +120,7 @@ def compile_and_apply_ddl_stmt(
         **_get_delta_context_args(ctx),
     )
 
-    if debug.flags.delta_plan_input:
+    if debug.flags.delta_plan:
         debug.header('Delta Plan Input')
         debug.dump(delta)
 
@@ -535,6 +535,8 @@ def _populate_migration(
     # The actual check for whether the schema matches is done
     # by DESCRIBE CURRENT MIGRATION AS JSON, to populate the
     # 'complete' flag.
+    if debug.flags.delta_plan:
+        debug.header('Populate Migration Applied Diff')
     for cmd in new_ddl:
         reloaded_diff = s_ddl.delta_from_ddl(
             cmd,
@@ -543,6 +545,9 @@ def _populate_migration(
             **_get_delta_context_args(ctx),
         )
         schema = reloaded_diff.apply(schema, delta_context)
+        if debug.flags.delta_plan:
+            debug.dump(reloaded_diff, schema=schema)
+
     current_tx.update_schema(schema)
 
     return dbstate.MigrationControlQuery(
@@ -578,7 +583,8 @@ def _describe_current_migration(
         else:
             description = ''
 
-        desc_ql = edgeql.parse(f'SELECT {qlquote.quote_literal(description)}')
+        desc_ql = edgeql.parse_query(
+            f'SELECT {qlquote.quote_literal(description)}')
         return compiler._compile_ql_query(
             ctx,
             desc_ql,
@@ -710,7 +716,7 @@ def _describe_current_migration(
             .decode('utf-8')
         )
 
-        desc_ql = edgeql.parse(
+        desc_ql = edgeql.parse_query(
             f'SELECT to_json({qlquote.quote_literal(desc)})'
         )
         return compiler._compile_ql_query(

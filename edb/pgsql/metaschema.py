@@ -62,7 +62,6 @@ from .resolver import sql_introspection
 from . import common
 from . import compiler
 from . import dbops
-from . import delta
 from . import types
 from . import params
 
@@ -78,7 +77,13 @@ qt = common.quote_type
 
 DATABASE_ID_NAMESPACE = uuidgen.UUID('0e6fed66-204b-11e9-8666-cffd58a5240b')
 CONFIG_ID_NAMESPACE = uuidgen.UUID('a48b38fa-349b-11e9-a6be-4f337f82f5ad')
-CONFIG_ID = uuidgen.UUID('172097a4-39f4-11e9-b189-9321eb2f4b97')
+CONFIG_ID = {
+    None: uuidgen.UUID('172097a4-39f4-11e9-b189-9321eb2f4b97'),
+    qltypes.ConfigScope.INSTANCE: uuidgen.UUID(
+        '172097a4-39f4-11e9-b189-9321eb2f4b98'),
+    qltypes.ConfigScope.DATABASE: uuidgen.UUID(
+        '172097a4-39f4-11e9-b189-9321eb2f4b99'),
+}
 
 
 class DBConfigTable(dbops.Table):
@@ -4148,13 +4153,221 @@ class GetPgTypeForEdgeDBTypeFunction(dbops.Function):
         )
 
 
+class FTSParseQueryFunction(dbops.Function):
+    """Return tsquery representing the given FTS input query."""
+
+    text = r'''
+    DECLARE
+        parts text[];
+        exclude text;
+        term text;
+        rest text;
+        cur_op text := NULL;
+        default_op text;
+        tsq tsquery;
+        el tsquery;
+        result tsquery := ''::tsquery;
+
+    BEGIN
+        -- Break up the query string into the current term, optional next
+        -- operator and the rest.
+        parts := regexp_match(
+            q, $$^(-)?((?:"[^"]*")|(?:\S+))\s*(OR|AND)?\s*(.*)$$
+        );
+        exclude := parts[1];
+        term := parts[2];
+        cur_op := parts[3];
+        rest := parts[4];
+
+        IF starts_with(term, '"') THEN
+            -- match as a phrase
+            tsq := phraseto_tsquery(language, trim(both '"' from term));
+        ELSE
+            tsq := to_tsquery(language, term);
+        END IF;
+
+        IF exclude IS NOT NULL THEN
+            tsq := !!tsq;
+        END IF;
+
+        -- figure out the operator between the current term and the next one
+        IF rest = '' THEN
+            -- base case, one one term left, so we ignore the cur_op even if
+            -- present
+            IF prev_op = 'OR' THEN
+                -- explicit 'OR' terms are "should"
+                should := array_append(should, tsq);
+            ELSIF starts_with(term, '"')
+               OR exclude IS NOT NULL
+               OR prev_op = 'AND' THEN
+                -- phrases, exclusions and 'AND' terms are "must"
+                must := array_append(must, tsq);
+            ELSE
+                -- regular terms are "should" by default
+                should := array_append(should, tsq);
+            END IF;
+        ELSE
+            -- recursion
+
+            IF prev_op = 'OR' OR cur_op = 'OR' THEN
+                -- if at least one of the suprrounding operators is 'OR',
+                -- then the phrase is put into "should" category
+                should := array_append(should, tsq);
+            ELSIF prev_op = 'AND' OR cur_op = 'AND' THEN
+                -- if at least one of the suprrounding operators is 'AND',
+                -- then the phrase is put into "must" category
+                must := array_append(must, tsq);
+            ELSIF starts_with(term, '"') OR exclude IS NOT NULL THEN
+                -- phrases and exclusions are "must"
+                must := array_append(must, tsq);
+            ELSE
+                -- regular terms are "should" by default
+                should := array_append(should, tsq);
+            END IF;
+
+            RETURN edgedb.fts_parse_query(
+                rest, language, must, should, cur_op);
+        END IF;
+
+        FOREACH el IN ARRAY should
+        LOOP
+            result := result || el;
+        END LOOP;
+
+        FOREACH el IN ARRAY must
+        LOOP
+            result := result && el;
+        END LOOP;
+
+        RETURN result;
+
+    END;
+    '''
+
+    def __init__(self) -> None:
+        super().__init__(
+            name=('edgedb', 'fts_parse_query'),
+            args=[
+                ('q', ('text',)),
+                ('language', ('regconfig',), "'english'"),
+                ('must', ('tsquery[]',), 'array[]::tsquery[]'),
+                ('should', ('tsquery[]',), 'array[]::tsquery[]'),
+                ('prev_op', ('text',), 'NULL'),
+            ],
+            returns=('tsquery',),
+            volatility='immutable',
+            language='plpgsql',
+            text=self.text,
+        )
+
+
+class FTSNormalizeWeightFunction(dbops.Function):
+    """Normalize an array of weights to be a 4-value weight array."""
+
+    text = r'''
+    SELECT
+        CASE COALESCE(array_length(weights, 1), 0)
+            WHEN 0 THEN array[1, 1, 1, 1]::float4[]
+            WHEN 1 THEN array[0, 0, 0, weights[1]]::float4[]
+            WHEN 2 THEN array[0, 0, weights[2], weights[1]]::float4[]
+            WHEN 3 THEN array[0, weights[3], weights[2], weights[1]]::float4[]
+            ELSE (
+                WITH raw as (
+                    SELECT w
+                    FROM UNNEST(weights) AS w
+                    ORDER BY w DESC
+                )
+                SELECT array_prepend(rest.w, first.arrw)::float4[]
+                FROM
+                (
+                    SELECT array_agg(rw1.w) as arrw
+                    FROM (
+                        SELECT w
+                        FROM (SELECT w FROM raw LIMIT 3) as rw0
+                        ORDER BY w ASC
+                    ) as rw1
+                ) AS first,
+                (
+                    SELECT avg(rw2.w) as w
+                    FROM (SELECT w FROM raw OFFSET 3) as rw2
+                ) AS rest
+            )
+        END
+    '''
+
+    def __init__(self) -> None:
+        super().__init__(
+            name=('edgedb', 'fts_normalize_weights'),
+            args=[
+                ('weights', ('float8[]',)),
+            ],
+            returns=('float4[]',),
+            volatility='immutable',
+            text=self.text,
+        )
+
+
+class FTSNormalizeDocFunction(dbops.Function):
+    """Normalize a document based on an array of weights."""
+
+    text = r'''
+    SELECT
+        CASE COALESCE(array_length(doc, 1), 0)
+            WHEN 0 THEN ''::tsvector
+            WHEN 1 THEN setweight(to_tsvector(language, doc[1]), 'A')
+            WHEN 2 THEN (
+                setweight(to_tsvector(language, doc[1]), 'A') ||
+                setweight(to_tsvector(language, doc[2]), 'B')
+            )
+            WHEN 3 THEN (
+                setweight(to_tsvector(language, doc[1]), 'A') ||
+                setweight(to_tsvector(language, doc[2]), 'B') ||
+                setweight(to_tsvector(language, doc[3]), 'C')
+            )
+            ELSE (
+                WITH raw as (
+                    SELECT d.v as t
+                    FROM UNNEST(doc) WITH ORDINALITY AS d(v, n)
+                    LEFT JOIN UNNEST(weights) WITH ORDINALITY AS w(v, n)
+                    ON d.n = w.n
+                    ORDER BY w.v DESC
+                )
+                SELECT
+                    setweight(to_tsvector(language, d.arr[1]), 'A') ||
+                    setweight(to_tsvector(language, d.arr[2]), 'B') ||
+                    setweight(to_tsvector(language, d.arr[3]), 'C') ||
+                    setweight(to_tsvector(language,
+                                          array_to_string(d.arr[4:], ' ')),
+                              'D')
+                FROM
+                (
+                    SELECT array_agg(raw.t) as arr
+                    FROM raw
+                ) AS d
+            )
+        END
+    '''
+
+    def __init__(self) -> None:
+        super().__init__(
+            name=('edgedb', 'fts_normalize_doc'),
+            args=[
+                ('doc', ('text[]',)),
+                ('weights', ('float8[]',)),
+                ('language', ('regconfig',)),
+            ],
+            returns=('tsvector',),
+            volatility='stable',
+            text=self.text,
+        )
+
+
 async def bootstrap(
     conn: pgcon.PGConnection,
     config_spec: edbconfig.Spec
 ) -> None:
     cmds = [
         dbops.CreateSchema(name='edgedb'),
-        dbops.CreateSchema(name='edgedbss'),
         dbops.CreateSchema(name='edgedbpub'),
         dbops.CreateSchema(name='edgedbstd'),
         dbops.CreateSchema(name='edgedbsql'),
@@ -4267,6 +4480,9 @@ async def bootstrap(
         dbops.CreateFunction(RangeValidateFunction()),
         dbops.CreateFunction(RangeUnpackLowerValidateFunction()),
         dbops.CreateFunction(RangeUnpackUpperValidateFunction()),
+        dbops.CreateFunction(FTSParseQueryFunction()),
+        dbops.CreateFunction(FTSNormalizeWeightFunction()),
+        dbops.CreateFunction(FTSNormalizeDocFunction()),
     ]
     commands = dbops.CommandGroup()
     commands.add_commands(cmds)
@@ -4295,9 +4511,11 @@ classref_attr_aliases = {
 }
 
 
-def tabname(schema: s_schema.Schema, obj: s_obj.Object) -> Tuple[str, str]:
+def tabname(
+    schema: s_schema.Schema, obj: s_obj.QualifiedObject
+) -> Tuple[str, str]:
     return (
-        'edgedbss',
+        'edgedbstd',
         common.get_backend_name(
             schema,
             obj,
@@ -4307,9 +4525,11 @@ def tabname(schema: s_schema.Schema, obj: s_obj.Object) -> Tuple[str, str]:
     )
 
 
-def inhviewname(schema: s_schema.Schema, obj: s_obj.Object) -> Tuple[str, str]:
+def inhviewname(
+    schema: s_schema.Schema, obj: s_obj.QualifiedObject
+) -> Tuple[str, str]:
     return (
-        'edgedbss',
+        'edgedbstd',
         common.get_backend_name(
             schema,
             obj,
@@ -4329,6 +4549,33 @@ def ptr_col_name(
     return psi.column_name  # type: ignore[no-any-return]
 
 
+def format_fields(
+    schema: s_schema.Schema,
+    obj: s_sources.Source,
+    fields: dict[str, str],
+) -> str:
+    """Format a dictionary of column mappings for database views
+
+    The reason we do it this way is because, since these views are
+    overwriting existing temporary views, we need to put all the
+    columns in the same order as the original view.
+    """
+    ptrs = [obj.getptr(schema, s_name.UnqualName(s)) for s in fields]
+    # Sort by UUID timestamp, except that source goes before target always
+    # so force that to sort first.
+    ptrs.sort(key=(
+        lambda p: (not p.is_link_source_property(schema), p.id.time)))
+
+    cols = []
+    for ptr in ptrs:
+        name = ptr.get_shortname(schema).name
+        val = fields[name]
+        sname = qi(ptr_col_name(schema, obj, name))
+        cols.append(f'            {val} AS {sname}')
+
+    return ',\n'.join(cols)
+
+
 def _generate_database_views(schema: s_schema.Schema) -> List[dbops.View]:
     Database = schema.get('sys::Database', type=s_objtypes.ObjectType)
     annos = Database.getptr(
@@ -4336,14 +4583,9 @@ def _generate_database_views(schema: s_schema.Schema) -> List[dbops.View]:
     int_annos = Database.getptr(
         schema, s_name.UnqualName('annotations__internal'), type=s_links.Link)
 
-    view_query = f'''
-        SELECT
-            ((d.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, Database, 'id'))},
-            (SELECT id FROM edgedb."_SchemaObjectType"
-                 WHERE name = 'sys::Database')
-                AS {qi(ptr_col_name(schema, Database, '__type__'))},
-            (CASE WHEN
+    view_fields = {
+        'id': "((d.description)->>'id')::uuid",
+        'internal': f"""(CASE WHEN
                 (edgedb.get_backend_capabilities()
                  & {int(params.BackendCapabilities.CREATE_DATABASE)}) != 0
              THEN
@@ -4354,16 +4596,16 @@ def _generate_database_views(schema: s_schema.Schema) -> List[dbops.View]:
                         {ql(defines.EDGEDB_SYSTEM_DB)})
                 )
              ELSE False END
-            )
-                AS {qi(ptr_col_name(schema, Database, 'internal'))},
-            (d.description)->>'name'
-                AS {qi(ptr_col_name(schema, Database, 'name'))},
-            (d.description)->>'name'
-                AS {qi(ptr_col_name(schema, Database, 'name__internal'))},
-            ARRAY[]::text[]
-                AS {qi(ptr_col_name(schema, Database, 'computed_fields'))},
-            ((d.description)->>'builtin')::bool
-                AS {qi(ptr_col_name(schema, Database, 'builtin'))}
+        )""",
+        'name': "(d.description)->>'name'",
+        'name__internal': "(d.description)->>'name'",
+        'computed_fields': 'ARRAY[]::text[]',
+        'builtin': "((d.description)->>'builtin')::bool",
+    }
+
+    view_query = f'''
+        SELECT
+            {format_fields(schema, Database, view_fields)}
         FROM
             pg_database dat
             CROSS JOIN LATERAL (
@@ -4376,16 +4618,16 @@ def _generate_database_views(schema: s_schema.Schema) -> List[dbops.View]:
             AND (d.description)->>'tenant_id' = edgedb.get_backend_tenant_id()
     '''
 
+    annos_link_fields = {
+        'source': "((d.description)->>'id')::uuid",
+        'target': "(annotations->>'id')::uuid",
+        'value': "(annotations->>'value')::text",
+        'owned': "(annotations->>'owned')::bool",
+    }
+
     annos_link_query = f'''
         SELECT
-            ((d.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, annos, 'source'))},
-            (annotations->>'id')::uuid
-                AS {qi(ptr_col_name(schema, annos, 'target'))},
-            (annotations->>'value')::text
-                AS {qi(ptr_col_name(schema, annos, 'value'))},
-            (annotations->>'owned')::bool
-                AS {qi(ptr_col_name(schema, annos, 'owned'))}
+            {format_fields(schema, annos, annos_link_fields)}
         FROM
             pg_database dat
             CROSS JOIN LATERAL (
@@ -4399,14 +4641,15 @@ def _generate_database_views(schema: s_schema.Schema) -> List[dbops.View]:
                 ) AS annotations
     '''
 
+    int_annos_link_fields = {
+        'source': "((d.description)->>'id')::uuid",
+        'target': "(annotations->>'id')::uuid",
+        'owned': "(annotations->>'owned')::bool",
+    }
+
     int_annos_link_query = f'''
         SELECT
-            ((d.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, int_annos, 'source'))},
-            (annotations->>'id')::uuid
-                AS {qi(ptr_col_name(schema, int_annos, 'target'))},
-            (annotations->>'owned')::bool
-                AS {qi(ptr_col_name(schema, int_annos, 'owned'))}
+            {format_fields(schema, int_annos, int_annos_link_fields)}
         FROM
             pg_database dat
             CROSS JOIN LATERAL (
@@ -4431,9 +4674,7 @@ def _generate_database_views(schema: s_schema.Schema) -> List[dbops.View]:
     views = []
     for obj, query in objects.items():
         tabview = dbops.View(name=tabname(schema, obj), query=query)
-        inhview = dbops.View(name=inhviewname(schema, obj), query=query)
         views.append(tabview)
-        views.append(inhview)
 
     return views
 
@@ -4452,17 +4693,15 @@ def _generate_extension_views(schema: s_schema.Schema) -> List[dbops.View]:
         catenate=False,
     )
 
-    view_query = f'''
-        SELECT
-            (e.value->>'id')::uuid
-                AS {qi(ptr_col_name(schema, ExtPkg, 'id'))},
-            (SELECT id FROM edgedb."_SchemaObjectType"
-                 WHERE name = 'sys::ExtensionPackage')
-                AS {qi(ptr_col_name(schema, ExtPkg, '__type__'))},
-            (e.value->>'name')
-                AS {qi(ptr_col_name(schema, ExtPkg, 'name'))},
-            (e.value->>'name__internal')
-                AS {qi(ptr_col_name(schema, ExtPkg, 'name__internal'))},
+    view_query_fields = {
+        'id': "(e.value->>'id')::uuid",
+        'name': "(e.value->>'name')",
+        'name__internal': "(e.value->>'name__internal')",
+        'script': "(e.value->>'script')",
+        'computed_fields': 'ARRAY[]::text[]',
+        'builtin': "(e.value->>'builtin')::bool",
+        'internal': "(e.value->>'internal')::bool",
+        'version': f'''
             (
                 (e.value->'version'->>'major')::int,
                 (e.value->'version'->>'minor')::int,
@@ -4476,15 +4715,12 @@ def _generate_extension_views(schema: s_schema.Schema) -> List[dbops.View]:
                     ARRAY[]::text[]
                 )
             )::{qt(ver_t)}
-                AS {qi(ptr_col_name(schema, ExtPkg, 'version'))},
-            (e.value->>'script')
-                AS {qi(ptr_col_name(schema, ExtPkg, 'script'))},
-            ARRAY[]::text[]
-                AS {qi(ptr_col_name(schema, ExtPkg, 'computed_fields'))},
-            (e.value->>'builtin')::bool
-                AS {qi(ptr_col_name(schema, ExtPkg, 'builtin'))},
-            (e.value->>'internal')::bool
-                AS {qi(ptr_col_name(schema, ExtPkg, 'internal'))}
+        ''',
+    }
+
+    view_query = f'''
+        SELECT
+            {format_fields(schema, ExtPkg, view_query_fields)}
         FROM
             jsonb_each(
                 edgedb.get_database_metadata(
@@ -4493,16 +4729,22 @@ def _generate_extension_views(schema: s_schema.Schema) -> List[dbops.View]:
             ) AS e
     '''
 
+    annos_link_fields = {
+        'source': "(e.value->>'id')::uuid",
+        'target': "(annotations->>'id')::uuid",
+        'value': "(annotations->>'value')::text",
+        'owned': "(annotations->>'owned')::bool",
+    }
+
+    int_annos_link_fields = {
+        'source': "(e.value->>'id')::uuid",
+        'target': "(annotations->>'id')::uuid",
+        'owned': "(annotations->>'owned')::bool",
+    }
+
     annos_link_query = f'''
         SELECT
-            (e.value->>'id')::uuid
-                AS {qi(ptr_col_name(schema, annos, 'source'))},
-            (annotations->>'id')::uuid
-                AS {qi(ptr_col_name(schema, annos, 'target'))},
-            (annotations->>'value')::text
-                AS {qi(ptr_col_name(schema, annos, 'value'))},
-            (annotations->>'is_owned')::bool
-                AS {qi(ptr_col_name(schema, annos, 'owned'))}
+            {format_fields(schema, annos, annos_link_fields)}
         FROM
             jsonb_each(
                 edgedb.get_database_metadata(
@@ -4517,12 +4759,7 @@ def _generate_extension_views(schema: s_schema.Schema) -> List[dbops.View]:
 
     int_annos_link_query = f'''
         SELECT
-            (e.value->>'id')::uuid
-                AS {qi(ptr_col_name(schema, int_annos, 'source'))},
-            (annotations->>'id')::uuid
-                AS {qi(ptr_col_name(schema, int_annos, 'target'))},
-            (annotations->>'is_owned')::bool
-                AS {qi(ptr_col_name(schema, int_annos, 'owned'))}
+            {format_fields(schema, int_annos, int_annos_link_fields)}
         FROM
             jsonb_each(
                 edgedb.get_database_metadata(
@@ -4544,9 +4781,7 @@ def _generate_extension_views(schema: s_schema.Schema) -> List[dbops.View]:
     views = []
     for obj, query in objects.items():
         tabview = dbops.View(name=tabname(schema, obj), query=query)
-        inhview = dbops.View(name=inhviewname(schema, obj), query=query)
         views.append(tabview)
-        views.append(inhview)
 
     return views
 
@@ -4579,33 +4814,23 @@ def _generate_role_views(schema: s_schema.Schema) -> List[dbops.View]:
         )
     '''
 
+    view_query_fields = {
+        'id': "((d.description)->>'id')::uuid",
+        'name': "(d.description)->>'name'",
+        'name__internal': "(d.description)->>'name'",
+        'superuser': f'{superuser}',
+        'abstract': 'False',
+        'is_derived': 'False',
+        'inherited_fields': 'ARRAY[]::text[]',
+        'computed_fields': 'ARRAY[]::text[]',
+        'builtin': "((d.description)->>'builtin')::bool",
+        'internal': 'False',
+        'password': "(d.description)->>'password_hash'",
+    }
+
     view_query = f'''
         SELECT
-            ((d.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, Role, 'id'))},
-            (SELECT id FROM edgedb."_SchemaObjectType"
-                 WHERE name = 'sys::Role')
-                AS {qi(ptr_col_name(schema, Role, '__type__'))},
-            (d.description)->>'name'
-                AS {qi(ptr_col_name(schema, Role, 'name'))},
-            (d.description)->>'name'
-                AS {qi(ptr_col_name(schema, Role, 'name__internal'))},
-            {superuser}
-                AS {qi(ptr_col_name(schema, Role, 'superuser'))},
-            False
-                AS {qi(ptr_col_name(schema, Role, 'abstract'))},
-            False
-                AS {qi(ptr_col_name(schema, Role, 'is_derived'))},
-            ARRAY[]::text[]
-                AS {qi(ptr_col_name(schema, Role, 'inherited_fields'))},
-            ARRAY[]::text[]
-                AS {qi(ptr_col_name(schema, Role, 'computed_fields'))},
-            ((d.description)->>'builtin')::bool
-                AS {qi(ptr_col_name(schema, Role, 'builtin'))},
-            False
-                AS {qi(ptr_col_name(schema, Role, 'internal'))},
-            (d.description)->>'password_hash'
-                AS {qi(ptr_col_name(schema, Role, 'password'))}
+            {format_fields(schema, Role, view_query_fields)}
         FROM
             pg_catalog.pg_roles AS a
             CROSS JOIN LATERAL (
@@ -4618,12 +4843,14 @@ def _generate_role_views(schema: s_schema.Schema) -> List[dbops.View]:
             AND (d.description)->>'tenant_id' = edgedb.get_backend_tenant_id()
     '''
 
+    member_of_link_query_fields = {
+        'source': "((d.description)->>'id')::uuid",
+        'target': "((md.description)->>'id')::uuid",
+    }
+
     member_of_link_query = f'''
         SELECT
-            ((d.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, member_of, 'source'))},
-            ((md.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, member_of, 'target'))}
+            {format_fields(schema, member_of, member_of_link_query_fields)}
         FROM
             pg_catalog.pg_roles AS a
             CROSS JOIN LATERAL (
@@ -4639,14 +4866,15 @@ def _generate_role_views(schema: s_schema.Schema) -> List[dbops.View]:
             ) AS md
     '''
 
+    bases_link_query_fields = {
+        'source': "((d.description)->>'id')::uuid",
+        'target': "((md.description)->>'id')::uuid",
+        'index': 'row_number() OVER (PARTITION BY a.oid ORDER BY m.roleid)',
+    }
+
     bases_link_query = f'''
         SELECT
-            ((d.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, bases, 'source'))},
-            ((md.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, bases, 'target'))},
-            row_number() OVER (PARTITION BY a.oid ORDER BY m.roleid)
-                AS {qi(ptr_col_name(schema, bases, 'index'))}
+            {format_fields(schema, bases, bases_link_query_fields)}
         FROM
             pg_catalog.pg_roles AS a
             CROSS JOIN LATERAL (
@@ -4664,12 +4892,7 @@ def _generate_role_views(schema: s_schema.Schema) -> List[dbops.View]:
 
     ancestors_link_query = f'''
         SELECT
-            ((d.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, ancestors, 'source'))},
-            ((md.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, ancestors, 'target'))},
-            row_number() OVER (PARTITION BY a.oid ORDER BY m.roleid)
-                AS {qi(ptr_col_name(schema, ancestors, 'index'))}
+            {format_fields(schema, ancestors, bases_link_query_fields)}
         FROM
             pg_catalog.pg_roles AS a
             CROSS JOIN LATERAL (
@@ -4685,16 +4908,16 @@ def _generate_role_views(schema: s_schema.Schema) -> List[dbops.View]:
             ) AS md
     '''
 
+    annos_link_fields = {
+        'source': "((d.description)->>'id')::uuid",
+        'target': "(annotations->>'id')::uuid",
+        'value': "(annotations->>'value')::text",
+        'owned': "(annotations->>'owned')::bool",
+    }
+
     annos_link_query = f'''
         SELECT
-            ((d.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, annos, 'source'))},
-            (annotations->>'id')::uuid
-                AS {qi(ptr_col_name(schema, annos, 'target'))},
-            (annotations->>'value')::text
-                AS {qi(ptr_col_name(schema, annos, 'value'))},
-            (annotations->>'owned')::bool
-                AS {qi(ptr_col_name(schema, annos, 'owned'))}
+            {format_fields(schema, annos, annos_link_fields)}
         FROM
             pg_catalog.pg_roles AS a
             CROSS JOIN LATERAL (
@@ -4710,14 +4933,15 @@ def _generate_role_views(schema: s_schema.Schema) -> List[dbops.View]:
                 ) AS annotations
     '''
 
+    int_annos_link_fields = {
+        'source': "((d.description)->>'id')::uuid",
+        'target': "(annotations->>'id')::uuid",
+        'owned': "(annotations->>'owned')::bool",
+    }
+
     int_annos_link_query = f'''
         SELECT
-            ((d.description)->>'id')::uuid
-                AS {qi(ptr_col_name(schema, int_annos, 'source'))},
-            (annotations->>'id')::uuid
-                AS {qi(ptr_col_name(schema, int_annos, 'target'))},
-            (annotations->>'owned')::bool
-                AS {qi(ptr_col_name(schema, int_annos, 'owned'))}
+            {format_fields(schema, int_annos, int_annos_link_fields)}
         FROM
             pg_catalog.pg_roles AS a
             CROSS JOIN LATERAL (
@@ -4745,9 +4969,7 @@ def _generate_role_views(schema: s_schema.Schema) -> List[dbops.View]:
     views = []
     for obj, query in objects.items():
         tabview = dbops.View(name=tabname(schema, obj), query=query)
-        inhview = dbops.View(name=inhviewname(schema, obj), query=query)
         views.append(tabview)
-        views.append(inhview)
 
     return views
 
@@ -4764,34 +4986,23 @@ def _generate_single_role_views(schema: s_schema.Schema) -> List[dbops.View]:
         schema, s_name.UnqualName('annotations'), type=s_links.Link)
     int_annos = Role.getptr(
         schema, s_name.UnqualName('annotations__internal'), type=s_links.Link)
+    view_query_fields = {
+        'id': "(json->>'id')::uuid",
+        'name': "json->>'name'",
+        'name__internal': "json->>'name'",
+        'superuser': 'True',
+        'abstract': 'False',
+        'is_derived': 'False',
+        'inherited_fields': 'ARRAY[]::text[]',
+        'computed_fields': 'ARRAY[]::text[]',
+        'builtin': 'True',
+        'internal': 'False',
+        'password': "json->>'password_hash'",
+    }
 
     view_query = f'''
         SELECT
-            (json->>'id')::uuid
-                AS {qi(ptr_col_name(schema, Role, 'id'))},
-            (SELECT id FROM edgedb."_SchemaObjectType"
-                 WHERE name = 'sys::Role')
-                AS {qi(ptr_col_name(schema, Role, '__type__'))},
-            json->>'name'
-                AS {qi(ptr_col_name(schema, Role, 'name'))},
-            json->>'name'
-                AS {qi(ptr_col_name(schema, Role, 'name__internal'))},
-            True
-                AS {qi(ptr_col_name(schema, Role, 'superuser'))},
-            False
-                AS {qi(ptr_col_name(schema, Role, 'abstract'))},
-            False
-                AS {qi(ptr_col_name(schema, Role, 'is_derived'))},
-            ARRAY[]::text[]
-                AS {qi(ptr_col_name(schema, Role, 'inherited_fields'))},
-            ARRAY[]::text[]
-                AS {qi(ptr_col_name(schema, Role, 'computed_fields'))},
-            True
-                AS {qi(ptr_col_name(schema, Role, 'builtin'))},
-            False
-                AS {qi(ptr_col_name(schema, Role, 'internal'))},
-            json->>'password_hash'
-                AS {qi(ptr_col_name(schema, Role, 'password'))}
+            {format_fields(schema, Role, view_query_fields)}
         FROM
             edgedbinstdata.instdata
         WHERE
@@ -4799,45 +5010,45 @@ def _generate_single_role_views(schema: s_schema.Schema) -> List[dbops.View]:
             AND json->>'tenant_id' = edgedb.get_backend_tenant_id()
     '''
 
+    member_of_link_query_fields = {
+        'source': "'00000000-0000-0000-0000-000000000000'::uuid",
+        'target': "'00000000-0000-0000-0000-000000000000'::uuid",
+    }
+
     member_of_link_query = f'''
         SELECT
-            '00000000-0000-0000-0000-000000000000'::uuid
-                AS {qi(ptr_col_name(schema, member_of, 'source'))},
-            '00000000-0000-0000-0000-000000000000'::uuid
-                AS {qi(ptr_col_name(schema, member_of, 'target'))}
+            {format_fields(schema, member_of, member_of_link_query_fields)}
         LIMIT 0
     '''
 
+    bases_link_query_fields = {
+        'source': "'00000000-0000-0000-0000-000000000000'::uuid",
+        'target': "'00000000-0000-0000-0000-000000000000'::uuid",
+        'index': "0::bigint",
+    }
+
     bases_link_query = f'''
         SELECT
-            '00000000-0000-0000-0000-000000000000'::uuid
-                AS {qi(ptr_col_name(schema, bases, 'source'))},
-            '00000000-0000-0000-0000-000000000000'::uuid
-                AS {qi(ptr_col_name(schema, bases, 'target'))},
-            0 AS {qi(ptr_col_name(schema, bases, 'index'))}
+            {format_fields(schema, bases, bases_link_query_fields)}
         LIMIT 0
     '''
 
     ancestors_link_query = f'''
         SELECT
-            '00000000-0000-0000-0000-000000000000'::uuid
-                AS {qi(ptr_col_name(schema, ancestors, 'source'))},
-            '00000000-0000-0000-0000-000000000000'::uuid
-                AS {qi(ptr_col_name(schema, ancestors, 'target'))},
-            0 AS {qi(ptr_col_name(schema, ancestors, 'index'))}
+            {format_fields(schema, ancestors, bases_link_query_fields)}
         LIMIT 0
     '''
 
+    annos_link_fields = {
+        'source': "(json->>'id')::uuid",
+        'target': "(annotations->>'id')::uuid",
+        'value': "(annotations->>'value')::text",
+        'owned': "(annotations->>'owned')::bool",
+    }
+
     annos_link_query = f'''
         SELECT
-            (json->>'id')::uuid
-                AS {qi(ptr_col_name(schema, annos, 'source'))},
-            (annotations->>'id')::uuid
-                AS {qi(ptr_col_name(schema, annos, 'target'))},
-            (annotations->>'value')::text
-                AS {qi(ptr_col_name(schema, annos, 'value'))},
-            (annotations->>'owned')::bool
-                AS {qi(ptr_col_name(schema, annos, 'owned'))}
+            {format_fields(schema, annos, annos_link_fields)}
         FROM
             edgedbinstdata.instdata
             CROSS JOIN LATERAL
@@ -4849,14 +5060,15 @@ def _generate_single_role_views(schema: s_schema.Schema) -> List[dbops.View]:
             AND json->>'tenant_id' = edgedb.get_backend_tenant_id()
     '''
 
+    int_annos_link_fields = {
+        'source': "(json->>'id')::uuid",
+        'target': "(annotations->>'id')::uuid",
+        'owned': "(annotations->>'owned')::bool",
+    }
+
     int_annos_link_query = f'''
         SELECT
-            (json->>'id')::uuid
-                AS {qi(ptr_col_name(schema, int_annos, 'source'))},
-            (annotations->>'id')::uuid
-                AS {qi(ptr_col_name(schema, int_annos, 'target'))},
-            (annotations->>'owned')::bool
-                AS {qi(ptr_col_name(schema, int_annos, 'owned'))}
+            {format_fields(schema, int_annos, int_annos_link_fields)}
         FROM
             edgedbinstdata.instdata
             CROSS JOIN LATERAL
@@ -4880,9 +5092,7 @@ def _generate_single_role_views(schema: s_schema.Schema) -> List[dbops.View]:
     views = []
     for obj, query in objects.items():
         tabview = dbops.View(name=tabname(schema, obj), query=query)
-        inhview = dbops.View(name=inhviewname(schema, obj), query=query)
         views.append(tabview)
-        views.append(inhview)
 
     return views
 
@@ -4893,25 +5103,19 @@ def _generate_schema_ver_views(schema: s_schema.Schema) -> List[dbops.View]:
         type=s_objtypes.ObjectType,
     )
 
+    view_fields = {
+        'id': "(v.value->>'id')::uuid",
+        'name': "(v.value->>'name')",
+        'name__internal': "(v.value->>'name')",
+        'version': "(v.value->>'version')::uuid",
+        'builtin': "(v.value->>'builtin')::bool",
+        'internal': "(v.value->>'internal')::bool",
+        'computed_fields': 'ARRAY[]::text[]',
+    }
+
     view_query = f'''
         SELECT
-            (v.value->>'id')::uuid
-                AS {qi(ptr_col_name(schema, Ver, 'id'))},
-            (SELECT id FROM edgedb."_SchemaObjectType"
-                 WHERE name = 'sys::GlobalSchemaVersion')
-                AS {qi(ptr_col_name(schema, Ver, '__type__'))},
-            (v.value->>'name')
-                AS {qi(ptr_col_name(schema, Ver, 'name'))},
-            (v.value->>'name')
-                AS {qi(ptr_col_name(schema, Ver, 'name__internal'))},
-            (v.value->>'version')::uuid
-                AS {qi(ptr_col_name(schema, Ver, 'version'))},
-            (v.value->>'builtin')::bool
-                AS {qi(ptr_col_name(schema, Ver, 'builtin'))},
-            (v.value->>'internal')::bool
-                AS {qi(ptr_col_name(schema, Ver, 'internal'))},
-            ARRAY[]::text[]
-                AS {qi(ptr_col_name(schema, Ver, 'computed_fields'))}
+            {format_fields(schema, Ver, view_fields)}
         FROM
             jsonb_each(
                 edgedb.get_database_metadata(
@@ -4927,9 +5131,7 @@ def _generate_schema_ver_views(schema: s_schema.Schema) -> List[dbops.View]:
     views = []
     for obj, query in objects.items():
         tabview = dbops.View(name=tabname(schema, obj), query=query)
-        inhview = dbops.View(name=inhviewname(schema, obj), query=query)
         views.append(tabview)
-        views.append(inhview)
 
     return views
 
@@ -4991,9 +5193,6 @@ def _generate_schema_alias_view(
         catenate=False,
     )
 
-    if module == 'sys' and not obj.get_abstract(schema):
-        bn = ('edgedbss', bn[1])
-
     targets = []
 
     if isinstance(obj, s_links.Link):
@@ -5008,9 +5207,14 @@ def _generate_schema_alias_view(
         if psi.table_type == expected_tt:
             ptr_name = ptr.get_shortname(schema).name
             col_name = psi.column_name
+            if col_name == '__type__':
+                val = f'{ql(str(obj.id))}::uuid'
+            else:
+                val = f'{qi(col_name)}'
+
             if col_name != ptr_name:
-                targets.append(f'{qi(col_name)} AS {qi(ptr_name)}')
-            targets.append(f'{qi(col_name)} AS {qi(col_name)}')
+                targets.append(f'{val} AS {qi(ptr_name)}')
+            targets.append(f'{val} AS {qi(col_name)}')
 
     prefix = module.capitalize()
 
@@ -5043,7 +5247,7 @@ def _generate_sql_information_schema() -> List[dbops.Command]:
             SELECT
                 id,
                 REGEXP_REPLACE(name, '::[^:]*$', '') AS module_name,
-                SPLIT_PART(name, '::', -1) AS table_name
+                REGEXP_REPLACE(name, '^.*::', '') as table_name
             FROM edgedb."_SchemaObjectType"
             WHERE internal IS NOT TRUE
         ),
@@ -5214,7 +5418,8 @@ def _generate_sql_information_schema() -> List[dbops.Command]:
         SELECT oid, nspname, nspowner, nspacl,
             tableoid, xmin, cmin, xmax, cmax, ctid
         FROM pg_namespace
-        WHERE nspname IN ('pg_catalog', 'pg_toast', 'information_schema')
+        WHERE nspname IN ('pg_catalog', 'pg_toast', 'information_schema',
+                          'edgedb')
         UNION ALL
         SELECT edgedbsql.uuid_to_oid(t.module_id), t.schema_name, 10, NULL,
             NULL, NULL, NULL, NULL, NULL, NULL
@@ -5252,13 +5457,26 @@ def _generate_sql_information_schema() -> List[dbops.Command]:
             ),
         ),
         dbops.View(
+            name=("edgedbsql", "pg_index"),
+            query="""
+        SELECT pi.*, pi.tableoid, pi.xmin, pi.cmin, pi.xmax, pi.cmax, pi.ctid
+        FROM pg_index pi
+        LEFT JOIN pg_class pr ON pi.indrelid = pr.oid
+        LEFT JOIN edgedbsql.pg_namespace pn ON pr.relnamespace = pn.oid
+        """,
+        ),
+        dbops.View(
             name=("edgedbsql", "pg_class"),
             query="""
+        -- Postgres tables
         SELECT pc.*, pc.tableoid, pc.xmin, pc.cmin, pc.xmax, pc.cmax, pc.ctid
         FROM pg_class pc
         JOIN pg_namespace pn ON pc.relnamespace = pn.oid
         WHERE nspname IN ('pg_catalog', 'pg_toast', 'information_schema')
+
         UNION ALL
+
+        -- user-defined tables
         SELECT
             oid,
             vt.table_name as relname,
@@ -5301,6 +5519,13 @@ def _generate_sql_information_schema() -> List[dbops.Command]:
             pc.ctid
         FROM pg_class pc
         JOIN edgedbsql.virtual_tables vt ON vt.id::text = pc.relname
+
+        UNION
+
+        -- indexes
+        SELECT pc.*, pc.tableoid, pc.xmin, pc.cmin, pc.xmax, pc.cmax, pc.ctid
+        FROM pg_class pc
+        JOIN edgedbsql.pg_index pi ON pc.oid = pi.indexrelid
         """,
         ),
         dbops.View(
@@ -5384,16 +5609,19 @@ def _generate_sql_information_schema() -> List[dbops.Command]:
         WHERE pa.attname NOT IN ('__type__')
         """,
         ),
-        dbops.View(
-            name=("edgedbsql", "pg_range"),
-            query="""
-        SELECT pr.*, pr.tableoid, pr.xmin, pr.cmin, pr.xmax, pr.cmax, pr.ctid
-        FROM pg_range pr
-        JOIN pg_type pt ON pt.oid = pr.rngtypid
-        JOIN pg_namespace pn ON pt.typnamespace = pn.oid
-        WHERE nspname IN ('pg_catalog', 'pg_toast', 'information_schema')
-        """,
-        ),
+        # # This is commented out, because we want to expose our ranges in
+        # # addition to PG native built-in ranges.
+        # dbops.View(
+        #     name=("edgedbsql", "pg_range"),
+        #     query="""
+        # SELECT pr.*, pr.tableoid, pr.xmin, pr.cmin, pr.xmax, pr.cmax, pr.ctid
+        # FROM pg_range pr
+        # JOIN pg_type pt ON pt.oid = pr.rngtypid
+        # JOIN pg_namespace pn ON pt.typnamespace = pn.oid
+        # WHERE nspname IN ('pg_catalog', 'pg_toast', 'information_schema',
+        #                   'edgedb')
+        # """,
+        # ),
         dbops.View(
             name=("edgedbsql", "pg_database"),
             query="""
@@ -5415,6 +5643,170 @@ def _generate_sql_information_schema() -> List[dbops.Command]:
             tableoid, xmin, cmin, xmax, cmax, ctid
         FROM pg_database
         WHERE datname LIKE '%_edgedb'
+        """,
+        ),
+
+        # HACK: there were problems with pg_dump when exposing this table, so
+        # I've added WHERE FALSE. The query could be simplified, but it may
+        # be needed in the future. Its EXPLAIN cost is 0..0 anyway.
+        dbops.View(
+            name=("edgedbsql", "pg_stats"),
+            query="""
+        SELECT n.nspname AS schemaname,
+            c.relname AS tablename,
+            a.attname,
+            s.stainherit AS inherited,
+            s.stanullfrac AS null_frac,
+            s.stawidth AS avg_width,
+            s.stadistinct AS n_distinct,
+            NULL::real[] AS most_common_vals,
+            s.stanumbers1 AS most_common_freqs,
+            s.stanumbers1 AS histogram_bounds,
+            s.stanumbers1[1] AS correlation,
+            NULL::real[] AS most_common_elems,
+            s.stanumbers1 AS most_common_elem_freqs,
+            s.stanumbers1 AS elem_count_histogram
+        FROM pg_statistic s
+        JOIN pg_class c ON c.oid = s.starelid
+        JOIN pg_attribute a ON c.oid = a.attrelid and a.attnum = s.staattnum
+        LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE FALSE
+        """,
+        ),
+        dbops.View(
+            name=("edgedbsql", "pg_statistic"),
+            query="""
+        SELECT
+            starelid,
+            staattnum,
+            stainherit,
+            stanullfrac,
+            stawidth,
+            stadistinct,
+            stakind1,
+            stakind2,
+            stakind3,
+            stakind4,
+            stakind5,
+            staop1,
+            staop2,
+            staop3,
+            staop4,
+            staop5,
+            stacoll1,
+            stacoll2,
+            stacoll3,
+            stacoll4,
+            stacoll5,
+            stanumbers1,
+            stanumbers2,
+            stanumbers3,
+            stanumbers4,
+            stanumbers5,
+            NULL::real[] AS stavalues1,
+            NULL::real[] AS stavalues2,
+            NULL::real[] AS stavalues3,
+            NULL::real[] AS stavalues4,
+            NULL::real[] AS stavalues5,
+            tableoid, xmin, cmin, xmax, cmax, ctid
+        FROM pg_statistic
+        """,
+        ),
+        dbops.View(
+            name=("edgedbsql", "pg_statistic_ext"),
+            query="""
+        SELECT
+            oid,
+            stxrelid,
+            stxname,
+            stxnamespace,
+            stxowner,
+            stxstattarget,
+            stxkeys,
+            stxkind,
+            stxexprs,
+            tableoid, xmin, cmin, xmax, cmax, ctid
+        FROM pg_statistic_ext
+        """,
+        ),
+        dbops.View(
+            name=("edgedbsql", "pg_statistic_ext_data"),
+            query="""
+        SELECT
+            stxoid,
+            stxdndistinct,
+            stxddependencies,
+            stxdmcv,
+            NULL::oid AS stxdexpr,
+            tableoid, xmin, cmin, xmax, cmax, ctid
+        FROM pg_statistic_ext_data
+        """,
+        ),
+        dbops.View(
+            name=("edgedbsql", "pg_stats_ext_exprs"),
+            query="""
+        SELECT
+            schemaname,
+            tablename,
+            statistics_schemaname,
+            statistics_name,
+            statistics_owner,
+            expr,
+            null_frac,
+            avg_width,
+            n_distinct,
+            NULL::real[] AS most_common_vals,
+            most_common_freqs,
+            NULL::real[] AS histogram_bounds,
+            correlation,
+            NULL::real[] AS most_common_elems,
+            most_common_elem_freqs,
+            elem_count_histogram
+        FROM pg_stats_ext_exprs
+        """,
+        ),
+        dbops.View(
+            name=("edgedbsql", "pg_proc"),
+            query="""
+        SELECT *, tableoid, xmin, cmin, xmax, cmax, ctid
+        FROM pg_proc
+        WHERE pronamespace IN (
+            SELECT edgedbsql.uuid_to_oid(module_id)
+            FROM edgedbsql.virtual_tables
+        )
+        """,
+        ),
+        dbops.View(
+            name=("edgedbsql", "pg_operator"),
+            query="""
+        SELECT *, tableoid, xmin, cmin, xmax, cmax, ctid
+        FROM pg_operator
+        WHERE oprnamespace IN (
+            SELECT edgedbsql.uuid_to_oid(module_id)
+            FROM edgedbsql.virtual_tables
+        )
+        """,
+        ),
+        dbops.View(
+            name=("edgedbsql", "pg_rewrite"),
+            query="""
+        SELECT pr.*, pr.tableoid, pr.xmin, pr.cmin, pr.xmax, pr.cmax, pr.ctid
+        FROM pg_rewrite pr
+        JOIN edgedbsql.pg_class pn ON pr.ev_class = pn.oid
+        """,
+        ),
+
+        # HACK: Automatically generated cast function for ranges/multiranges
+        # was causing issues for pg_dump. So at the end of the day we opt for
+        # not exposing any casts at all here since there is no real reason for
+        # this compatibility layer that is read-only to have elaborate casts
+        # present.
+        dbops.View(
+            name=("edgedbsql", "pg_cast"),
+            query="""
+        SELECT pc.*, pc.tableoid, pc.xmin, pc.cmin, pc.xmax, pc.cmax, pc.ctid
+        FROM pg_cast pc
+        WHERE false
         """,
         ),
     ]
@@ -5457,7 +5849,6 @@ def _generate_sql_information_schema() -> List[dbops.Command]:
             'pg_opfamily',
             'pg_partitioned_table',
             'pg_policy',
-            'pg_proc',
             'pg_publication',
             'pg_publication_rel',
             'pg_range',
@@ -5498,43 +5889,199 @@ def _generate_sql_information_schema() -> List[dbops.Command]:
     # views that expose the actual data.
     # I've been cautious about exposing too much data, for example limiting
     # pg_type to pg_catalog and pg_toast namespaces.
-    views = [virtual_tables] + tables_and_columns + [
-        dbops.View(
-            name=("edgedbsql", table_name),
-            query="SELECT {} LIMIT 0".format(
-                ",".join(
-                    f"NULL::information_schema.{type} AS {name}"
-                    for name, type in columns
-                )
-            ),
+    views = []
+
+    views.append(virtual_tables)
+    views.extend(tables_and_columns)
+
+    for table_name, columns in sql_introspection.INFORMATION_SCHEMA.items():
+        if table_name in ["tables", "columns"]:
+            continue
+        views.append(
+            dbops.View(
+                name=("edgedbsql", table_name),
+                query="SELECT {} LIMIT 0".format(
+                    ",".join(
+                        f"NULL::information_schema.{type} AS {name}"
+                        for name, type in columns
+                    )
+                ),
+            )
         )
-        for table_name, columns in sql_introspection.INFORMATION_SCHEMA.items()
-        if table_name not in ['tables', 'columns']
-    ] + pg_catalog_views + [
-        construct_pg_view(table_name, [c for c, _ in columns])
-        for table_name, columns in sql_introspection.PG_CATALOG.items()
-        if table_name not in [
+
+    views.extend(pg_catalog_views)
+
+    for table_name, columns in sql_introspection.PG_CATALOG.items():
+        if table_name in [
             'pg_type',
             'pg_attribute',
             'pg_namespace',
-            'pg_range',
             'pg_class',
             'pg_database',
-
-            # Some tables contain abstract columns (i.e. anyarray) so they
-            # cannot be created into a view. So let's just hide these tables.
+            'pg_proc',
+            'pg_operator',
             'pg_pltemplate',
             'pg_stats',
             'pg_stats_ext_exprs',
             'pg_statistic',
             'pg_statistic_ext',
             'pg_statistic_ext_data',
-        ]
+            'pg_rewrite',
+            'pg_cast',
+            'pg_index',
+        ]:
+            continue
+
+        views.append(construct_pg_view(table_name, [c for c, _ in columns]))
+
+    util_functions = [
+        dbops.Function(
+            name=('edgedbsql', 'has_schema_privilege'),
+            args=(
+                ('schema_name', 'text'),
+                ('privilege', 'text'),
+            ),
+            returns=('bool',),
+            text="""
+            SELECT COALESCE((
+                SELECT has_schema_privilege(oid, privilege)
+                FROM edgedbsql.pg_namespace
+                WHERE nspname = schema_name
+            ), TRUE);
+            """
+        ),
+        dbops.Function(
+            name=('edgedbsql', 'has_schema_privilege'),
+            args=(
+                ('schema_oid', 'oid'),
+                ('privilege', 'text'),
+            ),
+            returns=('bool',),
+            text="""
+                SELECT COALESCE(
+                    has_schema_privilege(schema_oid, privilege), TRUE
+                )
+            """
+        ),
+        dbops.Function(
+            name=('edgedbsql', 'has_table_privilege'),
+            args=(
+                ('table_name', 'text'),
+                ('privilege', 'text'),
+            ),
+            returns=('bool',),
+            text="""
+                SELECT has_table_privilege(oid, privilege)
+                FROM edgedbsql.pg_class
+                WHERE relname = table_name;
+            """
+        ),
+        dbops.Function(
+            name=('edgedbsql', 'has_table_privilege'),
+            args=(
+                ('schema_oid', 'oid'),
+                ('privilege', 'text'),
+            ),
+            returns=('bool',),
+            text="""
+                SELECT has_table_privilege(schema_oid, privilege)
+            """
+        ),
+
+        dbops.Function(
+            name=('edgedbsql', 'has_column_privilege'),
+            args=(
+                ('tbl', 'oid'),
+                ('col', 'smallint'),
+                ('privilege', 'text'),
+            ),
+            returns=('bool',),
+            text="""
+                SELECT has_column_privilege(tbl, col, privilege)
+            """
+        ),
+        dbops.Function(
+            name=('edgedbsql', 'has_column_privilege'),
+            args=(
+                ('tbl', 'text'),
+                ('col', 'smallint'),
+                ('privilege', 'text'),
+            ),
+            returns=('bool',),
+            text="""
+                SELECT has_column_privilege(oid, col, privilege)
+                FROM edgedbsql.pg_class
+                WHERE relname = tbl;
+            """
+        ),
+        dbops.Function(
+            name=('edgedbsql', 'has_column_privilege'),
+            args=(
+                ('tbl', 'oid'),
+                ('col', 'text'),
+                ('privilege', 'text'),
+            ),
+            returns=('bool',),
+            text="""
+                SELECT has_column_privilege(tbl, attnum, privilege)
+                FROM edgedbsql.pg_attribute pa
+                WHERE attrelid = tbl AND attname = col
+            """
+        ),
+        dbops.Function(
+            name=('edgedbsql', 'has_column_privilege'),
+            args=(
+                ('tbl', 'text'),
+                ('col', 'text'),
+                ('privilege', 'text'),
+            ),
+            returns=('bool',),
+            text="""
+                SELECT has_column_privilege(pc.oid, attnum, privilege)
+                FROM edgedbsql.pg_class pc
+                JOIN edgedbsql.pg_attribute pa ON pa.attrelid = pc.oid
+                WHERE pc.relname = tbl AND pa.attname = col;
+            """
+        ),
+
+        dbops.Function(
+            name=('edgedbsql', '_pg_truetypid'),
+            args=(
+                ('att', ('edgedbsql', 'pg_attribute')),
+                ('typ', ('edgedbsql', 'pg_type')),
+            ),
+            returns=('oid',),
+            volatility='IMMUTABLE',
+            strict=True,
+            text="""
+                SELECT CASE
+                    WHEN typ.typtype = 'd' THEN typ.typbasetype
+                    ELSE att.atttypid
+                END
+            """
+        ),
+        dbops.Function(
+            name=('edgedbsql', '_pg_truetypmod'),
+            args=(
+                ('att', ('edgedbsql', 'pg_attribute')),
+                ('typ', ('edgedbsql', 'pg_type')),
+            ),
+            returns=('int4',),
+            volatility='IMMUTABLE',
+            strict=True,
+            text="""
+                SELECT CASE
+                    WHEN typ.typtype = 'd' THEN typ.typtypmod
+                    ELSE att.atttypmod
+                END
+            """
+        ),
     ]
 
     return (
-        [dbops.CreateFunction(uuid_to_oid)]
+        [cast(dbops.Command, dbops.CreateFunction(uuid_to_oid))]
         + [dbops.CreateView(view) for view in views]
+        + [dbops.CreateFunction(func) for func in util_functions]
     )
 
 
@@ -5587,17 +6134,6 @@ def get_support_views(
         dbops.CreateView(dbops.View(name=tn, query=q), or_replace=True)
         for tn, q in cfg_views
     ])
-
-    abstract_conf = delta.CompositeMetaCommand.get_inhview(
-        schema,
-        schema.get('cfg::AbstractConfig', type=s_objtypes.ObjectType),
-        exclude_self=True,
-        pg_schema='edgedbss',
-    )
-
-    commands.add_command(
-        dbops.CreateView(abstract_conf, or_replace=True)
-    )
 
     for dbview in _generate_database_views(schema):
         commands.add_command(dbops.CreateView(dbview, or_replace=True))
@@ -6135,7 +6671,6 @@ def _generate_config_type_view(
 
     _memo.add(stype)
 
-    tname = stype.get_name(schema)
     views = []
 
     sources = []
@@ -6204,7 +6739,7 @@ def _generate_config_type_view(
     single_links = []
     multi_links = []
     multi_props = []
-    target_cols = []
+    target_cols: dict[s_pointers.Pointer, str] = {}
     where = ''
 
     path_steps = [p.get_shortname(schema).name for p, _ in path]
@@ -6252,7 +6787,7 @@ def _generate_config_type_view(
                     f'{pp_cast(f"{sval}->{ql(pn)}")}'
                     f' AS {qi(pp_col)}')
 
-                target_cols.append(extract_col)
+                target_cols[pp] = extract_col
 
                 constraints = pp.get_constraints(schema).objects(schema)
                 if any(c.issubclass(schema, exc) for c in constraints):
@@ -6269,25 +6804,17 @@ def _generate_config_type_view(
         sources.append(final_keysource)
 
         key_expr = 'k.key'
-        target_cols.append(f'{key_expr} AS id')
 
-        where = f'{key_expr} IS NOT NULL'
-
-        target_cols.append(textwrap.dedent(f'''\
-            (SELECT id
-            FROM edgedb."_SchemaObjectType"
-            WHERE name = 'cfg::' || ({sval}->>'_tname')) AS __type__'''))
+        tname = stype.get_name(schema).name
+        where = f"{key_expr} IS NOT NULL AND ({sval}->>'_tname') = {ql(tname)}"
 
     else:
-        key_expr = f"'{CONFIG_ID}'::uuid"
-
-        target_cols.extend([
-            f"{key_expr} AS id",
-            f'(SELECT id FROM edgedb."_SchemaObjectType" '
-            f"WHERE name = {ql(str(tname))}) AS __type__",
-        ])
+        key_expr = f"'{CONFIG_ID[scope]}'::uuid"
 
         key_components = []
+
+    id_ptr = stype.getptr(schema, s_name.UnqualName('id'))
+    target_cols[id_ptr] = f'{key_expr} AS id'
 
     for link in single_links:
         link_name = link.get_shortname(schema).name
@@ -6335,11 +6862,17 @@ def _generate_config_type_view(
             target_key_components = key_components + [f'k{link_name}.key']
 
         target_key = _build_key_expr(target_key_components)
-        target_cols.append(f'({target_key}) AS {qi(link_col)}')
+        target_cols[link] = f'({target_key}) AS {qi(link_col)}'
 
         views.extend(target_views)
 
-    target_cols_str = ',\n'.join(target_cols)
+    # You can't change the order of a postgres view... so
+    # sort them by uuid timestamp to keep them in order
+    target_cols_sorted = sorted(
+        target_cols.items(), key=lambda p: p[0].id.time
+    )
+
+    target_cols_str = ',\n'.join([x for _, x in target_cols_sorted if x])
 
     fromlist = ',\n'.join(f'LATERAL {s}' for s in sources)
 
@@ -6354,7 +6887,6 @@ def _generate_config_type_view(
         target_query += f'\nWHERE\n    {where}'
 
     views.append((tabname(schema, stype), target_query))
-    views.append((inhviewname(schema, stype), target_query))
 
     for link in multi_links:
         target_sources = list(sources)
@@ -6418,7 +6950,6 @@ def _generate_config_type_view(
             ''')
 
         views.append((tabname(schema, link), link_query))
-        views.append((inhviewname(schema, link), link_query))
 
     for prop, pp_cast in multi_props:
         target_sources = list(sources)
@@ -6440,7 +6971,6 @@ def _generate_config_type_view(
         ''')
 
         views.append((tabname(schema, prop), link_query))
-        views.append((inhviewname(schema, prop), link_query))
 
     return views, exclusive_props
 

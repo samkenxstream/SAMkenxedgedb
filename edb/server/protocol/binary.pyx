@@ -126,6 +126,15 @@ def parse_capabilities_header(value: bytes) -> uint64_t:
     return mask
 
 
+def parse_catalog_version_header(value: bytes) -> uint64_t:
+    if len(value) != 8:
+        raise errors.BinaryProtocolError(
+            f'catalog version header must be exactly 8 bytes (got {len(value)})'
+        )
+    cdef uint64_t catver = hton.unpack_uint64(cpython.PyBytes_AS_STRING(value))
+    return catver
+
+
 cdef inline bint parse_boolean(value: bytes, header: str):
     cdef bytes lower = value.lower()
     if lower == b'true':
@@ -409,9 +418,12 @@ cdef class EdgeConnection(frontend.FrontendConnection):
             raise errors.AuthenticationError(
                 'authentication failed: no authorization data provided')
 
-        for prefix in ["nbwt_", "edbt_"]:
+        token_version = 0
+        for prefix in ["nbwt1_", "nbwt_", "edbt1_", "edbt_"]:
             encoded_token = prefixed_token.removeprefix(prefix)
             if encoded_token != prefixed_token:
+                if prefix == "nbwt1_" or prefix == "edbt1_":
+                    token_version = 1
                 break
         else:
             raise errors.AuthenticationError(
@@ -440,8 +452,6 @@ cdef class EdgeConnection(frontend.FrontendConnection):
                 f'authentication failed: cannot decode JWT'
             ) from None
 
-        namespace = "edgedb.server"
-
         try:
             claims = json.loads(token.claims)
         except Exception as e:
@@ -449,17 +459,62 @@ cdef class EdgeConnection(frontend.FrontendConnection):
                 f'authentication failed: malformed claims section in JWT'
             ) from None
 
-        if not claims.get(f"{namespace}.any_role"):
-            token_roles = claims.get(f"{namespace}.roles")
-            if not isinstance(token_roles, list):
-                raise errors.AuthenticationError(
-                    f'authentication failed: malformed claims section in JWT'
-                    f' expected mapping in "role_names"'
-                )
+        self._check_jwt_authz(claims, token_version, user)
 
-            if user not in token_roles:
+    def _check_jwt_authz(self, claims, token_version, user):
+        # Check general key validity (e.g. whether it's a revoked key)
+        self.server.check_jwt(claims)
+
+        token_instances = None
+        token_roles = None
+        token_databases = None
+
+        if token_version == 1:
+            token_roles = self._get_jwt_edb_scope(claims, "edb.r")
+            token_instances = self._get_jwt_edb_scope(claims, "edb.i")
+            token_databases = self._get_jwt_edb_scope(claims, "edb.d")
+        else:
+            namespace = "edgedb.server"
+            if not claims.get(f"{namespace}.any_role"):
+                token_roles = claims.get(f"{namespace}.roles")
+                if not isinstance(token_roles, list):
+                    raise errors.AuthenticationError(
+                        f'authentication failed: malformed claims section in'
+                        f' JWT: expected a list in "{namespace}.roles"'
+                    )
+
+        if (
+            token_instances is not None
+            and self.server.get_instance_name() not in token_instances
+        ):
+            raise errors.AuthenticationError(
+                'authentication failed: secret key does not authorize '
+                f'access to this instance')
+
+        if (
+            token_databases is not None
+            and self.dbname not in token_databases
+        ):
+            raise errors.AuthenticationError(
+                'authentication failed: secret key does not authorize '
+                f'access to database "{self.dbname}"')
+
+        if token_roles is not None and user not in token_roles:
+            raise errors.AuthenticationError(
+                'authentication failed: secret key does not authorize '
+                f'access in role "{user}"')
+
+    def _get_jwt_edb_scope(self, claims, claim):
+        if not claims.get(f"{claim}.all"):
+            scope = claims.get(claim, [])
+            if not isinstance(scope, list):
                 raise errors.AuthenticationError(
-                    'authentication failed: role not authorized by this JWT')
+                    f'authentication failed: malformed claims section in'
+                    f' JWT: expected a list in "{claim}"'
+                )
+            return frozenset(scope)
+        else:
+            return None
 
     cdef WriteBuffer _make_authentication_sasl_initial(self, list methods):
         cdef WriteBuffer msg_buf
@@ -1322,11 +1377,14 @@ cdef class EdgeConnection(frontend.FrontendConnection):
 
             msg_buf = WriteBuffer.new_message(b'@')
 
-            msg_buf.write_int16(3)  # number of headers
+            msg_buf.write_int16(4)  # number of headers
             msg_buf.write_int16(DUMP_HEADER_BLOCK_TYPE)
             msg_buf.write_len_prefixed_bytes(DUMP_HEADER_BLOCK_TYPE_INFO)
             msg_buf.write_int16(DUMP_HEADER_SERVER_VER)
             msg_buf.write_len_prefixed_utf8(str(buildmeta.get_version()))
+            msg_buf.write_int16(DUMP_HEADER_SERVER_CATALOG_VERSION)
+            msg_buf.write_int32(8)
+            msg_buf.write_int64(buildmeta.EDGEDB_CATALOG_VERSION)
             msg_buf.write_int16(DUMP_HEADER_SERVER_TIME)
             msg_buf.write_len_prefixed_utf8(str(int(time.time())))
 
@@ -1468,12 +1526,15 @@ cdef class EdgeConnection(frontend.FrontendConnection):
         user_schema = _dbview.get_user_schema()
 
         dump_server_ver_str = None
+        cat_ver = None
         headers_num = self.buffer.read_int16()
         for _ in range(headers_num):
             hdrname = self.buffer.read_int16()
             hdrval = self.buffer.read_len_prefixed_bytes()
             if hdrname == DUMP_HEADER_SERVER_VER:
                 dump_server_ver_str = hdrval.decode('utf-8')
+            if hdrname == DUMP_HEADER_SERVER_CATALOG_VERSION:
+                cat_ver = parse_catalog_version_header(hdrval)
 
         proto_major = self.buffer.read_int16()
         proto_minor = self.buffer.read_int16()
@@ -1532,6 +1593,7 @@ cdef class EdgeConnection(frontend.FrontendConnection):
                     user_schema,
                     global_schema,
                     dump_server_ver_str,
+                    cat_ver,
                     schema_ddl,
                     schema_ids,
                     blocks,

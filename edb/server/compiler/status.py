@@ -194,3 +194,13 @@ def _describe(ql):
 @get_status.register(qlast.Rename)
 def _rename(ql):
     return f'RENAME'.encode()
+
+
+@get_status.register(qlast.ExplainStmt)
+def _explain(ql):
+    return b'ANALYZE QUERY'
+
+
+@get_status.register(qlast.AdministerStmt)
+def _administer(ql):
+    return b'ADMINISTER'

@@ -80,8 +80,19 @@ class Global(NamedObject):
     pass
 
 
+class Index(NamedObject):
+    pass
+
+
+class ConcreteIndex(NamedObject):
+    pass
+
+
 class Type(NamedObject):
     def is_scalar(self) -> bool:
+        return False
+
+    def is_object_type(self) -> bool:
         return False
 
 
@@ -154,6 +165,9 @@ class ObjectType(Type, Source):
     def is_scalar(self) -> bool:
         return False
 
+    def is_object_type(self) -> bool:
+        return True
+
 
 class Alias(ObjectType):
     pass
@@ -171,6 +185,9 @@ class UnionType(Type):
         component_ids = sorted(str(t.get_name(schema)) for t in self.types)
         nqname = f"({' | '.join(component_ids)})"
         return sn.QualName(name=nqname, module='__derived__')
+
+    def is_object_type(self) -> bool:
+        return True
 
 
 class Pointer(Source):
@@ -826,6 +843,12 @@ def trace_Path(
                             ctx.refs.add(qualify_name(
                                 tip_name, prev_step.ptr.name))
 
+        elif isinstance(step, qlast.Splat):
+            if step.type is not None:
+                _resolve_type_expr(step.type, ctx=ctx)
+            if step.intersection is not None:
+                _resolve_type_expr(step.intersection.type, ctx=ctx)
+
         else:
             tr = trace(step, ctx=ctx)
             if tr is not None:
@@ -1158,6 +1181,22 @@ def trace_DescribeStmt(
     if isinstance(node.object, qlast.ObjectRef):
         fq_name = ctx.get_ref_name(node.object)
         ctx.refs.add(fq_name)
+
+
+@trace.register
+def trace_ExplainStmt(
+    node: qlast.ExplainStmt, *,
+    ctx: TracerContext,
+) -> None:
+    pass
+
+
+@trace.register
+def trace_AdministerStmt(
+    node: qlast.AdministerStmt, *,
+    ctx: TracerContext,
+) -> None:
+    pass
 
 
 @trace.register

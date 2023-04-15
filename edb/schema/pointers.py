@@ -46,6 +46,7 @@ from . import inheriting
 from . import name as sn
 from . import objects as so
 from . import referencing
+from . import rewrites as s_rewrites
 from . import schema as s_schema
 from . import types as s_types
 from . import utils
@@ -288,13 +289,6 @@ def _merge_types(
 
     # When two pointers are merged, check target compatibility
     # and return a target that satisfies both specified targets.
-
-    # This is a hack: when deriving computed backlink pointers, we
-    # (ab)use inheritance to populate them with the appropriate
-    # linkprops. We fix it up to remove the bogus parents later.
-    if ptr.get_computed_backlink(schema):
-        return schema, t2
-
     elif (isinstance(t1, s_abc.ScalarType) !=
             isinstance(t2, s_abc.ScalarType)):
         # Mixing a property with a link.
@@ -532,6 +526,23 @@ class Pointer(referencing.NamedReferencedInheritingObject,
     computed_backlink = so.SchemaField(
         so.Object,
         default=None,
+        compcoef=0.99,
+    )
+
+    rewrites_refs = so.RefDict(
+        attr="rewrites",
+        requires_explicit_overloaded=True,
+        backref_attr="subject",
+        ref_cls=s_rewrites.Rewrite,
+    )
+
+    rewrites = so.SchemaField(
+        so.ObjectIndexByUnqualifiedName[s_rewrites.Rewrite],
+        inheritable=False,
+        ephemeral=True,
+        coerce=True,
+        compcoef=0.857,
+        default=so.DEFAULT_CONSTRUCTOR,
     )
 
     def is_tuple_indirection(self) -> bool:
@@ -740,6 +751,7 @@ class Pointer(referencing.NamedReferencedInheritingObject,
     def is_dumpable(self, schema: s_schema.Schema) -> bool:
         return (
             not self.is_pure_computable(schema)
+            and not self.get_shortname(schema).name == '__type__'
         )
 
     def generic(self, schema: s_schema.Schema) -> bool:
@@ -932,6 +944,26 @@ class Pointer(referencing.NamedReferencedInheritingObject,
 
         return delta
 
+    def get_local_rewrite(
+        self, schema: s_schema.Schema, kind: qltypes.RewriteKind
+    ) -> Optional[s_rewrites.Rewrite]:
+        rewrites = self.get_rewrites(schema)
+        if rewrites:
+            for rewrite in rewrites.objects(schema):
+                if rewrite.get_kind(schema) == kind:
+                    return rewrite
+        return None
+
+    def get_rewrite(
+        self, schema: s_schema.Schema, kind: qltypes.RewriteKind
+    ) -> Optional[s_rewrites.Rewrite]:
+        if rw := self.get_local_rewrite(schema, kind):
+            return rw
+        for anc in self.get_ancestors(schema).objects(schema):
+            if rw := anc.get_local_rewrite(schema, kind):
+                return rw
+        return None
+
 
 class PseudoPointer(s_abc.Pointer):
     # An abstract base class for pointer-like objects, i.e.
@@ -1082,8 +1114,11 @@ class ComputableRef:
         self.specified_type = specified_type
 
 
-class PointerCommandContext(sd.ObjectCommandContext[Pointer_T],
-                            s_anno.AnnotationSubjectCommandContext):
+class PointerCommandContext(
+    sd.ObjectCommandContext[Pointer_T],
+    s_anno.AnnotationSubjectCommandContext,
+    s_rewrites.RewriteSubjectCommandContext,
+):
     pass
 
 
@@ -1166,6 +1201,19 @@ class PointerCommandOrFragment(
             # There is an expression, therefore it is a computable.
             self.set_attribute_value('computable', True)
 
+        # If a change to the computable definition might be changing
+        # the bases, we need to create a rebase.
+        if base is not None and isinstance(self, sd.AlterObject):
+            assert isinstance(self, inheriting.InheritingObjectCommand)
+            assert isinstance(base, Pointer)
+            _, cmd = self._rebase_ref_cmd(
+                schema, context, self.scls,
+                self.scls.get_bases(schema).objects(schema),
+                [base],
+            )
+            if cmd:
+                self.add(cmd)
+
         return schema
 
     def _parse_computable(
@@ -1207,9 +1255,11 @@ class PointerCommandOrFragment(
             target = schema.get('std::BaseObject', type=s_types.Type)
             target_shell = target.as_shell(schema)
 
-        result_expr = expression.irast.expr
+        orig_expr = expression.irast.expr
+        if isinstance(orig_expr, irast.Set):
+            orig_expr = irutils.unwrap_set(orig_expr)
+        result_expr = orig_expr
         if isinstance(result_expr, irast.Set):
-            result_expr = irutils.unwrap_set(result_expr)
             if result_expr.rptr is not None:
                 result_expr, _ = irutils.collapse_type_intersection(
                     result_expr)
@@ -1238,6 +1288,32 @@ class PointerCommandOrFragment(
                 ):
                     base = aliased_ptr
                     schema = new_schema
+
+        # Do similar logic, but in reverse, to see if the computed pointer
+        # is a computed backlink that we need to keep track of.
+        computed_backlink = None
+        if (
+            base is None
+            and isinstance(orig_expr, irast.Set)
+            and orig_expr.rptr
+            and isinstance(
+                orig_expr.rptr.ptrref, irast.TypeIntersectionPointerRef)
+            and len(orig_expr.rptr.ptrref.rptr_specialization) == 1
+            and expr_rptr.direction is not PointerDirection.Outbound
+        ):
+            ptrref = list(orig_expr.rptr.ptrref.rptr_specialization)[0]
+            new_schema, aliased_ptr = irtyputils.ptrcls_from_ptrref(
+                ptrref, schema=schema
+            )
+            if (
+                aliased_ptr.get_target(new_schema) == source
+                and not ptrref.out_source.is_opaque_union
+                and isinstance(aliased_ptr, self.get_schema_metaclass())
+            ):
+                computed_backlink = aliased_ptr
+                schema = new_schema
+
+        self.set_attribute_value('computed_backlink', computed_backlink)
 
         self.set_attribute_value('expr', expression)
         required, card = expression.irast.cardinality.to_schema_value()
@@ -1361,6 +1437,7 @@ class PointerCommandOrFragment(
         target_as_singleton: bool = False,
         expr_description: Optional[str] = None,
         no_query_rewrites: bool = False,
+        make_globals_empty: bool = False,
         source_context: Optional[parsing.ParserContext] = None,
     ) -> s_expr.CompiledExpression:
         singletons: List[Union[s_types.Type, Pointer]] = []
@@ -1417,6 +1494,7 @@ class PointerCommandOrFragment(
                 apply_query_rewrites=(
                     not context.stdmode and not no_query_rewrites
                 ),
+                make_globals_empty=make_globals_empty,
                 track_schema_ref_exprs=track_schema_ref_exprs,
                 in_ddl_context_name=in_ddl_context_name,
             )
@@ -1693,7 +1771,7 @@ class PointerCommand(
                 if s_pointer.is_property(schema) and card.is_multi():
                     raise errors.SchemaDefinitionError(
                         f"default expression cannot refer to multi properties "
-                        "of insterted object",
+                        "of inserted object",
                         context=source_context,
                         hint="this is a temporary implementation restriction",
                     )
@@ -1701,10 +1779,32 @@ class PointerCommand(
                 if not s_pointer.is_property(schema):
                     raise errors.SchemaDefinitionError(
                         f"default expression cannot refer to links "
-                        "of insterted object",
+                        "of inserted object",
                         context=source_context,
                         hint='this is a temporary implementation restriction'
                     )
+
+        if (
+            self.scls.get_rewrite(schema, qltypes.RewriteKind.Update)
+            or self.scls.get_rewrite(schema, qltypes.RewriteKind.Insert)
+        ):
+            if self.scls.get_cardinality(schema).is_multi():
+                raise errors.SchemaDefinitionError(
+                    f"cannot specify a rewrite for "
+                    f"{scls.get_verbosename(schema, with_parent=True)} "
+                    f"because it is multi",
+                    context=self.source_context,
+                    hint='this is a temporary implementation restriction'
+                )
+
+            if self.scls.has_user_defined_properties(schema):
+                raise errors.SchemaDefinitionError(
+                    f"cannot specify a rewrite for "
+                    f"{scls.get_verbosename(schema, with_parent=True)} "
+                    f"because it has link properties",
+                    context=self.source_context,
+                    hint='this is a temporary implementation restriction'
+                )
 
     def _check_id_default(
         self,
@@ -2048,6 +2148,7 @@ class AlterPointer(
                     and not self.has_attribute_value('cardinality')
                 ):
                     self.set_attribute_value('cardinality', None)
+                self.set_attribute_value('computed_backlink', None)
 
             # Clear the placeholder value for 'expr'.
             self.set_attribute_value('expr', None)
@@ -2096,6 +2197,22 @@ class DeletePointer(
     referencing.DeleteReferencedInheritingObject[Pointer_T],
     PointerCommand[Pointer_T],
 ):
+    def _delete_begin(
+        self,
+        schema: s_schema.Schema,
+        context: sd.CommandContext,
+    ) -> s_schema.Schema:
+        schema = super()._delete_begin(schema, context)
+        if (
+            not context.canonical
+            and (target := self.scls.get_target(schema)) is not None
+            and not self.scls.is_endpoint_pointer(schema)
+            and (del_cmd := target.as_type_delete_if_dead(schema)) is not None
+        ):
+            self.add_caused(del_cmd)
+
+        return schema
+
     def _canonicalize(
         self,
         schema: s_schema.Schema,
@@ -2211,6 +2328,7 @@ class SetPointerType(
                 prompt=prompt,
                 old_type=str(old_type.get_name(schema)) if old_type else None,
                 new_type=str(new_type.get_name(schema)),
+                pointer_name=self.get_displayname(),
             ))
 
             self.cast_expr = s_expr.Expression.from_ast(
@@ -2590,7 +2708,8 @@ class AlterPointerUpperCardinality(
             self.set_annotation('required_input', dict(
                 placeholder=placeholder_name,
                 prompt=prompt,
-                type=str(type_name)
+                type=str(type_name),
+                pointer_name=self.get_displayname(),
             ))
 
             self.conv_expr = s_expr.Expression.from_ast(
@@ -2819,6 +2938,7 @@ class AlterPointerLowerCardinality(
                 placeholder=placeholder_name,
                 prompt=prompt,
                 type=str(type_name),
+                pointer_name=self.get_displayname(),
             ))
 
             self.fill_expr = s_expr.Expression.from_ast(
