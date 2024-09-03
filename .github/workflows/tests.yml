@@ -355,7 +355,7 @@ jobs:
         exit 1
 
     - name: Download cache key
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: shared-artifacts
         path: .tmp
@@ -427,7 +427,7 @@ jobs:
     # Restore the artifacts and environment variables
 
     - name: Download shared artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: shared-artifacts
         path: .tmp
@@ -562,7 +562,7 @@ jobs:
     # Restore the artifacts and environment variables
 
     - name: Download shared artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: shared-artifacts
         path: .tmp
@@ -678,13 +678,13 @@ jobs:
           python -m pip install requests
 
       - name: Download shared artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: shared-artifacts
           path: .tmp
 
       - name: Download python-test results
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: python-test-results
           path: .results
