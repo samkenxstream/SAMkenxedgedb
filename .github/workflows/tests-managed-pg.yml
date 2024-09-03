@@ -389,7 +389,7 @@ jobs:
     # Restore the artifacts and environment variables
 
     - name: Download shared artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: shared-artifacts
         path: .tmp
@@ -512,7 +512,7 @@ jobs:
           aws-region: us-east-2
 
       - name: Restore Terraform state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: aws-rds-tfstate
           path: .github/aws-rds
@@ -593,7 +593,7 @@ jobs:
     # Restore the artifacts and environment variables
 
     - name: Download shared artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: shared-artifacts
         path: .tmp
@@ -688,7 +688,7 @@ jobs:
       run: terraform init
 
     - name: Restore Terraform state
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: do-database-tfstate
         path: .github/do-database
@@ -752,7 +752,7 @@ jobs:
         run: terraform init
 
       - name: Restore Terraform state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: do-database-tfstate
           path: .github/do-database
@@ -845,7 +845,7 @@ jobs:
     # Restore the artifacts and environment variables
 
     - name: Download shared artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: shared-artifacts
         path: .tmp
@@ -967,7 +967,7 @@ jobs:
           export_default_credentials: true
 
       - name: Restore Terraform state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: gcp-cloud-sql-tfstate
           path: .github/gcp-cloud-sql
@@ -1063,7 +1063,7 @@ jobs:
     # Restore the artifacts and environment variables
 
     - name: Download shared artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: shared-artifacts
         path: .tmp
@@ -1186,7 +1186,7 @@ jobs:
           aws-region: us-east-2
 
       - name: Restore Terraform state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: aws-aurora-tfstate
           path: .github/aws-aurora
@@ -1269,7 +1269,7 @@ jobs:
     # Restore the artifacts and environment variables
 
     - name: Download shared artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: shared-artifacts
         path: .tmp
@@ -1364,7 +1364,7 @@ jobs:
       run: terraform init
 
     - name: Restore Terraform state
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4.1.7
       with:
         name: heroku-postgres-tfstate
         path: .github/heroku-postgres
@@ -1412,7 +1412,7 @@ jobs:
           aws-region: us-east-2
 
       - name: Restore Terraform state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: heroku-postgres-tfstate
           path: .github/heroku-postgres
